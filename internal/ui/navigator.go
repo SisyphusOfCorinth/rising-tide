@@ -297,17 +297,8 @@ func (n *Navigator) SetAlbumTracks(albumTitle string, tracks []tidal.Track) {
 	n.Push(frame)
 }
 
-// View renders the navigator panel within the given bounds.
+// View renders the navigator panel within the given bounds (no border).
 func (n Navigator) View(w, h int, focused bool) string {
-	innerW := w - 2
-	innerH := h - 2
-	if innerW < 0 {
-		innerW = 0
-	}
-	if innerH < 0 {
-		innerH = 0
-	}
-
 	var content string
 
 	if n.Loading {
@@ -319,21 +310,21 @@ func (n Navigator) View(w, h int, focused bool) string {
 		if cur == nil || cur.Kind == ViewEmpty {
 			content = StyleDim.Render("  Press / to search")
 		} else {
-			content = n.renderFrame(cur, innerW, innerH)
+			content = n.renderFrame(cur, w, h)
 		}
 	}
 
 	// Ensure content fills the panel
 	lines := strings.Split(content, "\n")
-	for len(lines) < innerH {
+	for len(lines) < h {
 		lines = append(lines, "")
 	}
-	if len(lines) > innerH {
-		lines = lines[:innerH]
+	if len(lines) > h {
+		lines = lines[:h]
 	}
 	body := strings.Join(lines, "\n")
 
-	return panelStyle(innerW, innerH, focused).Render(body)
+	return lipgloss.NewStyle().Width(w).Height(h).Render(body)
 }
 
 // renderFrame renders the items in a stack frame with cursor highlighting

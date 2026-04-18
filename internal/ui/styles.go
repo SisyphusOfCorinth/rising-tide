@@ -26,20 +26,16 @@ var (
 	ColorProgress  = lipgloss.Color("#00BFFF")
 )
 
-// --- Panel Borders ---
+// --- Panel Borders (used only by fallback cover art placeholder) ---
 
-func borderFocused(w, h int) lipgloss.Style {
+func panelStyle(w, h int, focused bool) lipgloss.Style {
+	color := ColorBorder
+	if focused {
+		color = ColorFocused
+	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(ColorFocused).
-		Width(w).
-		Height(h)
-}
-
-func borderUnfocused(w, h int) lipgloss.Style {
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(ColorBorder).
+		BorderForeground(color).
 		Width(w).
 		Height(h)
 }

@@ -116,6 +116,10 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ready = true
+		// Re-render cover art from cached image at new dimensions.
+		if m.coverArt.Supported && m.coverArt.Img != nil {
+			return m, rerenderCoverArt(m.coverArt.Img, m.coverArt.CoverURL, CoverCols, CoverRows)
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -185,8 +189,15 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case PlaybackStartedMsg:
 		m.nowPlaying.SetTrack(msg.Track.Title, msg.Track.Artist.Name, msg.Track.Album.Title)
 		m.statusMsg = ""
-		// Start tick loop and wait for track completion concurrently.
-		return m, tea.Batch(tickPlaybackProgress(), waitForPlaybackDone(m.player))
+		cmds := []tea.Cmd{tickPlaybackProgress(), waitForPlaybackDone(m.player)}
+		// Fetch cover art if kitty is supported and this is a different album.
+		if m.coverArt.Supported {
+			newCoverURL := tidal.CoverURL(msg.Track.Album.Cover, "640x640")
+			if newCoverURL != m.coverArt.CoverURL {
+				cmds = append(cmds, fetchCoverArt(msg.Track.Album.Cover, CoverCols, CoverRows))
+			}
+		}
+		return m, tea.Batch(cmds...)
 
 	case PlaybackErrorMsg:
 		m.nowPlaying.Clear()
@@ -195,6 +206,7 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case PlaybackFinishedMsg:
 		m.nowPlaying.Clear()
+		m.coverArt.Clear()
 		return m, nil
 
 	case TickMsg:
@@ -219,6 +231,17 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.deviceList = msg.Devices
 		m.deviceCursor = 0
 		m.devicePickerVisible = true
+		return m, nil
+
+	// --- Cover Art messages ---
+	case CoverArtMsg:
+		if msg.Err != nil {
+			// Silently ignore cover art errors -- not critical.
+			return m, nil
+		}
+		m.coverArt.CoverURL = msg.CoverURL
+		m.coverArt.Rows = msg.Rows
+		m.coverArt.Img = msg.Img
 		return m, nil
 	}
 
@@ -411,41 +434,117 @@ func (m App) View() string {
 		return "Authenticating with Tidal...\n\nCheck your browser or terminal for the login prompt."
 	}
 
-	// Calculate panel dimensions
-	bottomH := 3
-	topH := m.height - bottomH
-	if topH < 3 {
-		topH = 3
-	}
-
-	sidebarW := m.sidebar.Width()
+	// Calculate panel dimensions.
 	coverW := m.coverArt.Width()
-	navW := m.width - sidebarW - coverW
-	if navW < 10 {
-		navW = 10
+	sidebarW := m.sidebar.Width()
+
+	var full string
+
+	if m.coverArt.Supported {
+		// Kitty layout: cover art is a fixed 640x640px box in the top-right.
+		// The now-playing bar spans the full terminal width below.
+		//
+		// +---------+-------------------+--------------------+
+		// | Sidebar | Navigator         |    Cover Art       |
+		// |         |  (topH rows)      |  (fixed 640x640)   |
+		// +---------+-------------------+--------------------+
+		// | Now Playing (full width)                          |
+		// +---------------------------------------------------+
+		//
+		// The total output must be exactly m.height lines.
+		// The top section (sidebar + navigator + cover art) is fixed at
+		// CoverRows to match the 640x640 image. The bottom section (now-playing)
+		// fills all remaining vertical space.
+		topH := m.coverArt.Height()
+		if topH > m.height-1 {
+			topH = m.height - 1
+		}
+		bottomH := m.height - topH
+		_ = bottomH // used below for bottom bar padding
+
+		leftW := m.width - coverW
+		navW := leftW - sidebarW
+		if navW < 10 {
+			navW = 10
+		}
+
+		// Render the left side of the top section (sidebar + navigator).
+		sidebarView := m.sidebar.View(sidebarW, topH, m.focused == PaneSidebar)
+		navView := m.navigator.View(navW, topH, m.focused == PaneNavigator)
+		leftTop := lipgloss.JoinHorizontal(lipgloss.Top, sidebarView, navView)
+
+		// Build the top section: left panel lines with kitty sequence on line 0.
+		// The kitty sequence renders the full image as a graphic overlay spanning
+		// coverRows rows -- no per-row strips needed.
+		leftLines := strings.Split(leftTop, "\n")
+		kittyRows := m.coverArt.Rows
+		topLines := make([]string, topH)
+		for i := 0; i < topH; i++ {
+			if i < len(leftLines) {
+				topLines[i] = leftLines[i]
+			} else {
+				topLines[i] = ""
+			}
+			// Append the kitty sequence (only line 0 has the image data;
+			// remaining kittyRows entries are empty strings).
+			if i < len(kittyRows) && kittyRows[i] != "" {
+				topLines[i] += kittyRows[i]
+			}
+		}
+
+		// If no cover art loaded yet, use the placeholder panel.
+		if len(kittyRows) == 0 {
+			coverView := m.coverArt.View(coverW, topH, m.focused == PaneCoverArt)
+			leftTop = lipgloss.JoinHorizontal(lipgloss.Top, leftTop, coverView)
+			topLines = strings.Split(leftTop, "\n")
+			// Ensure exactly topH lines.
+			for len(topLines) < topH {
+				topLines = append(topLines, "")
+			}
+			topLines = topLines[:topH]
+		}
+
+		topSection := strings.Join(topLines, "\n")
+
+		// Now-playing bar spans full terminal width.
+		bottomBar := m.nowPlaying.View(m.width)
+		if m.statusMsg != "" {
+			bottomBar = StyleError.Render(" "+m.statusMsg+" ") + "\n" + bottomBar
+		}
+		// Pad/truncate bottom bar to exactly bottomH lines.
+		bottomLines := strings.Split(bottomBar, "\n")
+		for len(bottomLines) < bottomH {
+			bottomLines = append(bottomLines, "")
+		}
+		bottomLines = bottomLines[:bottomH]
+		bottomBar = strings.Join(bottomLines, "\n")
+
+		full = topSection + "\n" + bottomBar
+	} else {
+		// Fallback layout: original three-column top row + full-width bottom bar.
+		bottomH := 3
+		navW := m.width - sidebarW - coverW
+		if navW < 10 {
+			navW = 10
+		}
+		topH := m.height - bottomH
+		if topH < 3 {
+			topH = 3
+		}
+
+		sidebarView := m.sidebar.View(sidebarW, topH, m.focused == PaneSidebar)
+		navView := m.navigator.View(navW, topH, m.focused == PaneNavigator)
+		coverView := m.coverArt.View(coverW, topH, m.focused == PaneCoverArt)
+
+		topRow := lipgloss.JoinHorizontal(lipgloss.Top, sidebarView, navView, coverView)
+
+		bottomBar := m.nowPlaying.View(m.width)
+		if m.statusMsg != "" {
+			bottomBar = StyleError.Render(" "+m.statusMsg+" ") + "\n" + bottomBar
+		}
+
+		full = lipgloss.JoinVertical(lipgloss.Left, topRow, bottomBar)
 	}
-
-	// Render each panel
-	sidebarView := m.sidebar.View(sidebarW, topH, m.focused == PaneSidebar)
-	navView := m.navigator.View(navW, topH, m.focused == PaneNavigator)
-	coverView := m.coverArt.View(coverW, topH, m.focused == PaneCoverArt)
-
-	// Compose the top row
-	topRow := lipgloss.JoinHorizontal(lipgloss.Top,
-		sidebarView,
-		navView,
-		coverView,
-	)
-
-	// Bottom bar
-	bottomBar := m.nowPlaying.View(m.width)
-
-	// Status message (errors, device info)
-	if m.statusMsg != "" {
-		bottomBar = StyleError.Render(" "+m.statusMsg+" ") + "\n" + bottomBar
-	}
-
-	full := lipgloss.JoinVertical(lipgloss.Left, topRow, bottomBar)
 
 	// Overlay search bar if active
 	if m.searchActive {

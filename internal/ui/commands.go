@@ -3,6 +3,9 @@ package ui
 import (
 	"context"
 	"fmt"
+	"image"
+	_ "image/jpeg" // register JPEG decoder for cover art
+	"net/http"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -122,6 +125,56 @@ func listDevices() tea.Cmd {
 	return func() tea.Msg {
 		devices, err := player.ListDevices()
 		return DeviceListMsg{Devices: devices, Err: err}
+	}
+}
+
+// fetchCoverArt downloads a cover image from Tidal's CDN and encodes it as
+// Kitty terminal graphics escape sequences. Cover art URLs are public (no
+// auth needed). The image is scaled and sliced into horizontal strips, one
+// per terminal row.
+func fetchCoverArt(coverUUID string, cols, rows int) tea.Cmd {
+	return func() tea.Msg {
+		if coverUUID == "" {
+			return CoverArtMsg{} // no cover available
+		}
+
+		coverURL := tidal.CoverURL(coverUUID, "640x640")
+
+		// Fetch the image from Tidal's CDN.
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(coverURL)
+		if err != nil {
+			return CoverArtMsg{CoverURL: coverURL, Err: err}
+		}
+		defer resp.Body.Close()
+
+		// Decode the JPEG image.
+		img, _, err := image.Decode(resp.Body)
+		if err != nil {
+			return CoverArtMsg{CoverURL: coverURL, Err: err}
+		}
+
+		// Render into kitty escape sequences, one per terminal row.
+		kittyRows := RenderKittyRows(img, cols, rows)
+
+		return CoverArtMsg{
+			CoverURL: coverURL,
+			Rows:     kittyRows,
+			Img:      img,
+		}
+	}
+}
+
+// rerenderCoverArt re-encodes a cached image at new dimensions (e.g. after
+// terminal resize) without re-fetching from the network.
+func rerenderCoverArt(img image.Image, coverURL string, cols, rows int) tea.Cmd {
+	return func() tea.Msg {
+		kittyRows := RenderKittyRows(img, cols, rows)
+		return CoverArtMsg{
+			CoverURL: coverURL,
+			Rows:     kittyRows,
+			Img:      img,
+		}
 	}
 }
 

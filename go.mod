@@ -13,6 +13,7 @@ require (
 	github.com/mewkiz/flac v1.0.13
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 	go.etcd.io/bbolt v1.4.3
+	golang.org/x/image v0.23.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sys v0.40.0
 	golang.org/x/term v0.39.0
