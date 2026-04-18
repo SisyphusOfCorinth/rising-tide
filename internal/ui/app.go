@@ -561,23 +561,36 @@ func (m App) View() string {
 		full = m.overlayHelp(full)
 	}
 
+	// When kitty protocol is active, prepend a "delete all images" command
+	// before each frame. This clears stale image artifacts on resize or
+	// navigation. The current frame's kitty sequence re-renders the image.
+	if m.coverArt.Supported {
+		full = "\x1b_Ga=d,d=a\x1b\\" + full
+	}
+
 	return full
 }
 
 // overlaySearchBar renders the search input at the top of the screen.
+// When kitty cover art is active, the search bar is centered within the
+// left panel area so it doesn't overlap the image.
 func (m App) overlaySearchBar(base string) string {
 	searchBar := StyleSearchBar.Width(50).Render(
 		"Search: " + m.searchInput.View(),
 	)
 
-	// Place at top center
-	lines := strings.Split(base, "\n")
-	searchLines := strings.Split(searchBar, "\n")
-
-	xOffset := (m.width - 54) / 2
+	// Center within the left panel area (exclude cover art column).
+	availW := m.width
+	if m.coverArt.Supported {
+		availW = m.width - m.coverArt.Width()
+	}
+	xOffset := (availW - 54) / 2
 	if xOffset < 0 {
 		xOffset = 0
 	}
+
+	lines := strings.Split(base, "\n")
+	searchLines := strings.Split(searchBar, "\n")
 
 	for i, sl := range searchLines {
 		row := i + 1
@@ -623,7 +636,11 @@ func (m App) overlayHelp(base string) string {
 	helpLines := strings.Split(helpBox, "\n")
 
 	yOffset := (m.height - len(helpLines)) / 2
-	xOffset := (m.width - 44) / 2
+	availW := m.width
+	if m.coverArt.Supported {
+		availW = m.width - m.coverArt.Width()
+	}
+	xOffset := (availW - 44) / 2
 	if yOffset < 0 {
 		yOffset = 0
 	}
@@ -667,8 +684,12 @@ func (m App) overlayDevicePicker(base string) string {
 	lines := strings.Split(base, "\n")
 	pickerLines := strings.Split(pickerBox, "\n")
 
+	availW := m.width
+	if m.coverArt.Supported {
+		availW = m.width - m.coverArt.Width()
+	}
 	yOffset := (m.height - len(pickerLines)) / 2
-	xOffset := (m.width - 64) / 2
+	xOffset := (availW - 64) / 2
 	if yOffset < 0 {
 		yOffset = 0
 	}
