@@ -80,8 +80,12 @@ type PlaybackErrorMsg struct {
 	Err error
 }
 
-// PlaybackFinishedMsg signals that the current track ended naturally.
-type PlaybackFinishedMsg struct{}
+// PlaybackFinishedMsg signals that the current track ended. The Generation
+// field is checked against the app's playGeneration to distinguish natural
+// track endings from stops caused by skip/new-play commands.
+type PlaybackFinishedMsg struct {
+	Generation uint64
+}
 
 // TickMsg drives the progress bar update loop (fires every second).
 type TickMsg time.Time

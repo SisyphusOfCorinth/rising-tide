@@ -109,14 +109,16 @@ func tickPlaybackProgress() tea.Cmd {
 }
 
 // waitForPlaybackDone blocks until the player's done channel closes.
-func waitForPlaybackDone(p *player.Player) tea.Cmd {
+// The generation parameter is passed through so the handler can ignore
+// stale finish signals from tracks that were stopped by a skip command.
+func waitForPlaybackDone(p *player.Player, generation uint64) tea.Cmd {
 	return func() tea.Msg {
 		ch := p.Done()
 		if ch == nil {
-			return PlaybackFinishedMsg{}
+			return PlaybackFinishedMsg{Generation: generation}
 		}
 		<-ch
-		return PlaybackFinishedMsg{}
+		return PlaybackFinishedMsg{Generation: generation}
 	}
 }
 

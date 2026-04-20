@@ -65,6 +65,18 @@ type App struct {
 	deviceList          []player.DeviceInfo
 	deviceCursor        int
 
+	// Queue: tracks to play after the current one finishes.
+	queue       []tidal.Track
+	queueIndex  int // index of the currently playing track in queue
+	queueVisible bool
+	queueCursor  int // cursor position in the queue overlay
+
+	// playGeneration is incremented each time a new track play is initiated
+	// (via skip, queue select, or track selection). waitForPlaybackDone
+	// captures the current generation; PlaybackFinishedMsg is only acted on
+	// if the generation still matches, preventing cascade-skip bugs.
+	playGeneration uint64
+
 	// Backend references (injected, not owned)
 	tidal  *tidal.Client
 	player *player.Player
@@ -189,7 +201,7 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case PlaybackStartedMsg:
 		m.nowPlaying.SetTrack(msg.Track.Title, msg.Track.Artist.Name, msg.Track.Album.Title)
 		m.statusMsg = ""
-		cmds := []tea.Cmd{tickPlaybackProgress(), waitForPlaybackDone(m.player)}
+		cmds := []tea.Cmd{tickPlaybackProgress(), waitForPlaybackDone(m.player, m.playGeneration)}
 		// Fetch cover art if kitty is supported and this is a different album.
 		if m.coverArt.Supported {
 			newCoverURL := tidal.CoverURL(msg.Track.Album.Cover, "640x640")
@@ -205,8 +217,24 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case PlaybackFinishedMsg:
+		// Ignore stale finish signals from tracks that were stopped by a
+		// skip or new-play command. Only act if the generation matches.
+		if msg.Generation != m.playGeneration {
+			return m, nil
+		}
+		// Advance to the next track in the queue.
+		m.queueIndex++
+		if m.queueIndex < len(m.queue) {
+			next := m.queue[m.queueIndex]
+			m.playGeneration++
+			m.nowPlaying.Resolving = true
+			return m, resolveAndPlay(m.tidal, next)
+		}
+		// Queue exhausted.
 		m.nowPlaying.Clear()
 		m.coverArt.Clear()
+		m.queue = nil
+		m.queueIndex = 0
 		return m, nil
 
 	case TickMsg:
@@ -319,6 +347,36 @@ func (m App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// --- Queue overlay ---
+	if m.queueVisible {
+		switch {
+		case key.Matches(msg, m.keys.Queue) || key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+			m.queueVisible = false
+			return m, nil
+		case key.Matches(msg, m.keys.CursorDown):
+			if m.queueCursor < len(m.queue)-1 {
+				m.queueCursor++
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.CursorUp):
+			if m.queueCursor > 0 {
+				m.queueCursor--
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.Select):
+			// Jump to the selected track in the queue and play it.
+			if m.queueCursor >= 0 && m.queueCursor < len(m.queue) {
+				m.queueIndex = m.queueCursor
+				m.playGeneration++
+				m.nowPlaying.Resolving = true
+				m.queueVisible = false
+				return m, resolveAndPlay(m.tidal, m.queue[m.queueIndex])
+			}
+			return m, nil
+		}
+		return m, nil
+	}
+
 	// --- Global keys ---
 	switch {
 	case key.Matches(msg, m.keys.Quit):
@@ -326,6 +384,13 @@ func (m App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keys.Help):
 		m.helpVisible = true
+		return m, nil
+
+	case key.Matches(msg, m.keys.Queue):
+		if len(m.queue) > 0 {
+			m.queueVisible = !m.queueVisible
+			m.queueCursor = m.queueIndex // start cursor at currently playing track
+		}
 		return m, nil
 
 	case key.Matches(msg, m.keys.Search):
@@ -346,7 +411,15 @@ func (m App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.SkipTrack):
-		// TODO: implement queue-based skip
+		// Skip to the next track in the queue. Increment generation so the
+		// PlaybackFinishedMsg from the stopped track is ignored.
+		if m.nowPlaying.TrackTitle != "" && m.queueIndex+1 < len(m.queue) {
+			m.queueIndex++
+			m.playGeneration++
+			next := m.queue[m.queueIndex]
+			m.nowPlaying.Resolving = true
+			return m, resolveAndPlay(m.tidal, next)
+		}
 		return m, nil
 
 	case key.Matches(msg, m.keys.DeviceMenu):
@@ -417,7 +490,32 @@ func (m App) handleNavigatorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		case NavItemTrack:
 			m.nowPlaying.Resolving = true
-			return m, resolveAndPlay(m.tidal, *item.Track)
+			// Build a queue from all tracks in the current view, starting
+			// from the selected track. This mimics standard Tidal behavior:
+			// selecting track 4 of 10 queues tracks 4-10.
+			m.queue = nil
+			m.queueIndex = 0
+			cur := m.navigator.Current()
+			if cur != nil {
+				foundSelected := false
+				for _, navItem := range cur.Items {
+					if navItem.Kind == NavItemTrack && navItem.Track != nil {
+						if navItem.Track.ID == item.Track.ID {
+							foundSelected = true
+						}
+						if foundSelected {
+							m.queue = append(m.queue, *navItem.Track)
+						}
+					}
+				}
+			}
+			// If we didn't build a queue (e.g. from search results with mixed types),
+			// just queue the single track.
+			if len(m.queue) == 0 {
+				m.queue = []tidal.Track{*item.Track}
+			}
+			m.playGeneration++
+			return m, resolveAndPlay(m.tidal, m.queue[0])
 		}
 	}
 
@@ -558,6 +656,11 @@ func (m App) View() string {
 	// Overlay device picker if visible
 	if m.devicePickerVisible {
 		full = m.overlayDevicePicker(full)
+	}
+
+	// Overlay queue if visible
+	if m.queueVisible {
+		full = m.overlayQueue(full)
 	}
 
 	// Overlay help if visible
@@ -705,6 +808,78 @@ func (m App) overlayDevicePicker(base string) string {
 		row := yOffset + i
 		if row < len(lines) {
 			lines[row] = strings.Repeat(" ", xOffset) + pl
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// overlayQueue renders the playback queue as a scrollable overlay.
+func (m App) overlayQueue(base string) string {
+	content := StyleSectionHeader.Render("QUEUE") + "\n\n"
+
+	// Show tracks with the currently playing one highlighted.
+	maxVisible := 20
+	startIdx := m.queueCursor - maxVisible/2
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	endIdx := startIdx + maxVisible
+	if endIdx > len(m.queue) {
+		endIdx = len(m.queue)
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		track := m.queue[i]
+		dur := formatTime(float64(track.Duration))
+		label := fmt.Sprintf("%s - %s  %s", track.Artist.Name, track.Title, StyleDim.Render(dur))
+
+		prefix := "   "
+		if i == m.queueIndex {
+			prefix = " > " // currently playing
+		}
+		if i == m.queueCursor {
+			content += StyleItemSelected.Render(prefix+label) + "\n"
+		} else if i == m.queueIndex {
+			content += StyleTitle.Render(prefix+label) + "\n"
+		} else if i < m.queueIndex {
+			content += StyleItemMuted.Render(prefix+label) + "\n"
+		} else {
+			content += StyleItemNormal.Render(prefix+label) + "\n"
+		}
+	}
+
+	content += "\n" + StyleDim.Render("; or Esc to close")
+
+	boxW := 60
+	availW := m.width
+	if m.coverArt.Supported {
+		availW = m.width - m.coverArt.Width()
+	}
+
+	queueBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorPrimary).
+		Padding(1, 2).
+		Width(boxW).
+		Render(content)
+
+	lines := strings.Split(base, "\n")
+	queueLines := strings.Split(queueBox, "\n")
+
+	yOffset := (m.height - len(queueLines)) / 2
+	xOffset := (availW - boxW - 4) / 2
+	if yOffset < 0 {
+		yOffset = 0
+	}
+	if xOffset < 0 {
+		xOffset = 0
+	}
+
+	for i, ql := range queueLines {
+		row := yOffset + i
+		if row < len(lines) {
+			lines[row] = strings.Repeat(" ", xOffset) + ql
 		}
 	}
 
