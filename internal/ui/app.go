@@ -335,9 +335,13 @@ func (m App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.searchInput.Cursor.SetMode(cursor.CursorBlink)
 
 	case key.Matches(msg, m.keys.PlayPause):
-		if m.nowPlaying.Playing || m.nowPlaying.Resolving {
+		if m.nowPlaying.TrackTitle != "" {
 			_ = m.player.Pause()
 			m.nowPlaying.Playing = !m.nowPlaying.Playing
+			// Restart the tick loop on unpause so the progress bar resumes.
+			if m.nowPlaying.Playing {
+				return m, tickPlaybackProgress()
+			}
 		}
 		return m, nil
 
