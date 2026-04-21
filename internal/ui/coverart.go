@@ -110,33 +110,25 @@ func (c *CoverArt) SetImage(img image.Image, coverURL string, rows []string, new
 // action is needed. After returning a non-empty string, subsequent calls
 // return "" until the image changes.
 //
-// Returns the kitty escape sequence(s) for this frame.
-//
-// On the transmit frame: sends the new image ONLY (no delete). Both old
-// and new images coexist -- the new one covers the old one visually.
-// On the NEXT frame: sends the delete for the old image. By this point
-// BubbleTea has fully written all text rows, so the terminal repaint
-// triggered by the delete uses fresh text content (no ghost).
+// KittySequenceForFrame returns the kitty escape sequence(s) for this frame,
+// or "" if the image is already placed and nothing changed.
 func (c *CoverArt) KittySequenceForFrame() string {
-	// If we have a pending delete AND the new image is already placed,
-	// it's safe to delete the old image now (text layer is fresh from
-	// the previous full-rewrite frame).
-	if c.deleteSeq != "" && c.placed {
-		seq := c.deleteSeq
-		c.deleteSeq = ""
-		return seq
-	}
+	var seq string
 
-	// Transmit the new image. The delete of the old image will happen
-	// on the NEXT frame after the text layer has been fully rewritten.
+	// Transmit the new image.
 	if !c.placed && c.transmitSeq != "" {
-		seq := c.transmitSeq
+		seq += c.transmitSeq
 		c.placed = true
 		c.prevImageID = c.imageID
-		return seq
 	}
 
-	return ""
+	// Delete old image (deferred from resize or CoverArt.Clear).
+	if c.deleteSeq != "" {
+		seq += c.deleteSeq
+		c.deleteSeq = ""
+	}
+
+	return seq
 }
 
 // NeedsRender returns true if the cover art has a pending transmit or delete.

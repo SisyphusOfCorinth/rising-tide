@@ -315,7 +315,15 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			return m, nil
 		}
+		albumChanged := m.coverArt.CoverURL != msg.CoverURL
 		m.coverArt.SetImage(msg.Img, msg.CoverURL, msg.Rows, msg.ImageID)
+		if albumChanged {
+			// Clear the terminal when the album changes. This erases ALL
+			// text (including stale text under the old image) and forces
+			// BubbleTea to rewrite everything. The new kitty image is
+			// placed as part of the rewrite.
+			return m, func() tea.Msg { return tea.ClearScreen() }
+		}
 		return m, nil
 	}
 
@@ -664,16 +672,6 @@ func (m App) View() string {
 			// Append the kitty sequence to line 0. It renders the image as
 			// a graphic overlay spanning CoverRows x CoverCols cells.
 			topLines[0] += kittySeq
-
-			// Force BubbleTea's diff renderer to rewrite EVERY line on this
-			// transition frame. Without this, the renderer skips unchanged
-			// lines, leaving stale text in the terminal's text layer that
-			// becomes visible as a ghost when the image changes.
-			// The invisible \x1b[0m (SGR reset) + unique suffix makes each
-			// line differ from the previous frame without visible effect.
-			for i := range topLines {
-				topLines[i] += "\x1b[0m "
-			}
 		} else if !m.coverArt.HasImage() {
 			// No image loaded yet -- show the placeholder panel.
 			coverView := m.coverArt.View(coverW, topH, m.focused == PaneCoverArt)
@@ -700,14 +698,6 @@ func (m App) View() string {
 			bottomLines = append(bottomLines, "")
 		}
 		bottomLines = bottomLines[:bottomH]
-
-		// If this is a transition frame (kitty image being placed), force
-		// bottom lines to be unique too, so the full screen is rewritten.
-		if kittySeq != "" {
-			for i := range bottomLines {
-				bottomLines[i] += "\x1b[0m "
-			}
-		}
 
 		bottomBar = strings.Join(bottomLines, "\n")
 
