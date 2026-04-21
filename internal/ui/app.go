@@ -29,8 +29,7 @@ const (
 type FocusedPane int
 
 const (
-	PaneSidebar   FocusedPane = iota
-	PaneNavigator
+	PaneNavigator FocusedPane = iota
 	PaneCoverArt
 )
 
@@ -49,7 +48,6 @@ type App struct {
 	// Child panels (struct fields, not interfaces)
 	navigator  Navigator
 	nowPlaying NowPlaying
-	sidebar    Sidebar
 	coverArt   CoverArt
 
 	// Search overlay
@@ -64,6 +62,10 @@ type App struct {
 	devicePickerVisible bool
 	deviceList          []player.DeviceInfo
 	deviceCursor        int
+
+	// Library menu overlay ('p' key)
+	libraryVisible bool
+	libraryCursor  int // 0=Favorites, 1=My Mixes
 
 	// Queue: tracks to play after the current one finishes.
 	queue       []tidal.Track
@@ -101,10 +103,9 @@ func NewApp(client *tidal.Client, p *player.Player, st *store.SecretsStore) App 
 	return App{
 		state:     StateReady, // Auth is handled before the TUI starts
 		focused:   PaneNavigator,
-		navigator: NewNavigator(),
+		navigator:  NewNavigator(),
 		nowPlaying: NewNowPlaying(),
-		sidebar:   NewSidebar(),
-		coverArt:  NewCoverArt(),
+		coverArt:   NewCoverArt(),
 		searchInput: ti,
 		help:      h,
 		tidal:     client,
@@ -130,7 +131,9 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 		// Re-render cover art from cached image at new dimensions.
 		if m.coverArt.Supported && m.coverArt.Img != nil {
-			return m, rerenderCoverArt(m.coverArt.Img, m.coverArt.CoverURL, CoverCols, CoverRows)
+			m.coverArt.imageID++
+			m.coverArt.placed = false
+			return m, rerenderCoverArt(m.coverArt.Img, m.coverArt.CoverURL, CoverCols, CoverRows, m.coverArt.imageID)
 		}
 		return m, nil
 
@@ -189,6 +192,34 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.navigator.SetAlbumTracks(msg.AlbumTitle, msg.Tracks)
 		return m, nil
 
+	// --- Library messages ---
+	case FavoritesMsg:
+		if msg.Err != nil {
+			m.navigator.Loading = false
+			m.navigator.ErrMsg = msg.Err.Error()
+			return m, nil
+		}
+		m.navigator.SetTrackList("Favorites", ViewFavorites, msg.Tracks)
+		return m, nil
+
+	case MixListMsg:
+		if msg.Err != nil {
+			m.navigator.Loading = false
+			m.navigator.ErrMsg = msg.Err.Error()
+			return m, nil
+		}
+		m.navigator.SetMixList(msg.Mixes)
+		return m, nil
+
+	case MixTracksMsg:
+		if msg.Err != nil {
+			m.navigator.Loading = false
+			m.navigator.ErrMsg = msg.Err.Error()
+			return m, nil
+		}
+		m.navigator.SetTrackList(msg.MixTitle, ViewMix, msg.Tracks)
+		return m, nil
+
 	// --- Playback messages ---
 	case StreamURLMsg:
 		if msg.Err != nil {
@@ -206,7 +237,8 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.coverArt.Supported {
 			newCoverURL := tidal.CoverURL(msg.Track.Album.Cover, "640x640")
 			if newCoverURL != m.coverArt.CoverURL {
-				cmds = append(cmds, fetchCoverArt(msg.Track.Album.Cover, CoverCols, CoverRows))
+				m.coverArt.imageID++
+				cmds = append(cmds, fetchCoverArt(msg.Track.Album.Cover, CoverCols, CoverRows, m.coverArt.imageID))
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -264,12 +296,9 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// --- Cover Art messages ---
 	case CoverArtMsg:
 		if msg.Err != nil {
-			// Silently ignore cover art errors -- not critical.
 			return m, nil
 		}
-		m.coverArt.CoverURL = msg.CoverURL
-		m.coverArt.Rows = msg.Rows
-		m.coverArt.Img = msg.Img
+		m.coverArt.SetImage(msg.Img, msg.CoverURL, msg.Rows, msg.ImageID)
 		return m, nil
 	}
 
@@ -377,6 +406,36 @@ func (m App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// --- Library overlay ---
+	if m.libraryVisible {
+		switch {
+		case key.Matches(msg, m.keys.Library) || key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+			m.libraryVisible = false
+			return m, nil
+		case key.Matches(msg, m.keys.CursorDown):
+			if m.libraryCursor < 1 { // 2 options: 0=Favorites, 1=My Mixes
+				m.libraryCursor++
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.CursorUp):
+			if m.libraryCursor > 0 {
+				m.libraryCursor--
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.Select):
+			m.libraryVisible = false
+			m.navigator.Loading = true
+			switch m.libraryCursor {
+			case 0: // Favorites
+				return m, fetchFavorites(m.tidal)
+			case 1: // My Mixes
+				return m, fetchMixList(m.tidal)
+			}
+			return m, nil
+		}
+		return m, nil
+	}
+
 	// --- Global keys ---
 	switch {
 	case key.Matches(msg, m.keys.Quit):
@@ -386,10 +445,15 @@ func (m App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.helpVisible = true
 		return m, nil
 
+	case key.Matches(msg, m.keys.Library):
+		m.libraryVisible = !m.libraryVisible
+		m.libraryCursor = 0
+		return m, nil
+
 	case key.Matches(msg, m.keys.Queue):
 		if len(m.queue) > 0 {
 			m.queueVisible = !m.queueVisible
-			m.queueCursor = m.queueIndex // start cursor at currently playing track
+			m.queueCursor = m.queueIndex
 		}
 		return m, nil
 
@@ -426,19 +490,13 @@ func (m App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, listDevices()
 
 	// Pane focus navigation (shift+HJKL)
-	case key.Matches(msg, m.keys.FocusLeft):
-		m.focused = PaneSidebar
+	case key.Matches(msg, m.keys.FocusLeft), key.Matches(msg, m.keys.FocusUp),
+		key.Matches(msg, m.keys.FocusDown):
+		m.focused = PaneNavigator
 		return m, nil
 	case key.Matches(msg, m.keys.FocusRight):
-		m.focused = PaneCoverArt
-		return m, nil
-	case key.Matches(msg, m.keys.FocusUp), key.Matches(msg, m.keys.FocusDown):
-		// Cycle through panes
-		if m.focused == PaneNavigator {
-			m.focused = PaneSidebar
-		} else {
-			m.focused = PaneNavigator
-		}
+		// Reserved for future use (cover art panel focus)
+		m.focused = PaneNavigator
 		return m, nil
 	}
 
@@ -487,6 +545,10 @@ func (m App) handleNavigatorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case NavItemAlbum:
 			m.navigator.Loading = true
 			return m, fetchAlbumTracks(m.tidal, item.Album.ID, item.Album.Title)
+
+		case NavItemMix:
+			m.navigator.Loading = true
+			return m, fetchMixTracks(m.tidal, item.Mix.ID, item.Mix.Title)
 
 		case NavItemTrack:
 			m.nowPlaying.Resolving = true
@@ -538,25 +600,19 @@ func (m App) View() string {
 
 	// Calculate panel dimensions.
 	coverW := m.coverArt.Width()
-	sidebarW := m.sidebar.Width()
 
 	var full string
 
 	if m.coverArt.Supported {
 		// Kitty layout: cover art is a fixed 640x640px box in the top-right.
-		// The now-playing bar spans the full terminal width below.
+		// The navigator fills the full left area. Now-playing bar below.
 		//
-		// +---------+-------------------+--------------------+
-		// | Sidebar | Navigator         |    Cover Art       |
-		// |         |  (topH rows)      |  (fixed 640x640)   |
-		// +---------+-------------------+--------------------+
-		// | Now Playing (full width)                          |
-		// +---------------------------------------------------+
-		//
-		// The total output must be exactly m.height lines.
-		// The top section (sidebar + navigator + cover art) is fixed at
-		// CoverRows to match the 640x640 image. The bottom section (now-playing)
-		// fills all remaining vertical space.
+		// +-------------------------------+--------------------+
+		// | Navigator                     |    Cover Art       |
+		// |  (topH rows)                  |  (fixed 640x640)   |
+		// +-------------------------------+--------------------+
+		// | Now Playing (full width)                            |
+		// +-----------------------------------------------------+
 		topH := m.coverArt.Height()
 		if topH > m.height-1 {
 			topH = m.height - 1
@@ -564,47 +620,45 @@ func (m App) View() string {
 		bottomH := m.height - topH
 		_ = bottomH // used below for bottom bar padding
 
-		leftW := m.width - coverW
-		navW := leftW - sidebarW
+		navW := m.width - coverW
 		if navW < 10 {
 			navW = 10
 		}
 
-		// Render the left side of the top section (sidebar + navigator).
-		sidebarView := m.sidebar.View(sidebarW, topH, m.focused == PaneSidebar)
+		// Render the navigator (full left area).
 		navView := m.navigator.View(navW, topH, m.focused == PaneNavigator)
-		leftTop := lipgloss.JoinHorizontal(lipgloss.Top, sidebarView, navView)
 
 		// Build the top section: left panel lines with kitty sequence on line 0.
-		// The kitty sequence renders the full image as a graphic overlay spanning
-		// coverRows rows -- no per-row strips needed.
-		leftLines := strings.Split(leftTop, "\n")
-		kittyRows := m.coverArt.Rows
+		// Get the kitty sequence for this frame (transmit + optional delete).
+		// Returns "" if the image is already placed and nothing changed.
+		kittySeq := m.coverArt.KittySequenceForFrame()
+
+		navLines := strings.Split(navView, "\n")
 		topLines := make([]string, topH)
 		for i := 0; i < topH; i++ {
-			if i < len(leftLines) {
-				topLines[i] = leftLines[i]
+			if i < len(navLines) {
+				topLines[i] = navLines[i]
 			} else {
 				topLines[i] = ""
 			}
-			// Append the kitty sequence (only line 0 has the image data;
-			// remaining kittyRows entries are empty strings).
-			if i < len(kittyRows) && kittyRows[i] != "" {
-				topLines[i] += kittyRows[i]
-			}
 		}
 
-		// If no cover art loaded yet, use the placeholder panel.
-		if len(kittyRows) == 0 {
+		if kittySeq != "" {
+			// Append the kitty sequence to line 0. It renders the image as
+			// a graphic overlay spanning CoverRows x CoverCols cells.
+			topLines[0] += kittySeq
+		} else if !m.coverArt.HasImage() {
+			// No image loaded yet -- show the placeholder panel.
 			coverView := m.coverArt.View(coverW, topH, m.focused == PaneCoverArt)
-			leftTop = lipgloss.JoinHorizontal(lipgloss.Top, leftTop, coverView)
-			topLines = strings.Split(leftTop, "\n")
-			// Ensure exactly topH lines.
+			joined := lipgloss.JoinHorizontal(lipgloss.Top, navView, coverView)
+			topLines = strings.Split(joined, "\n")
 			for len(topLines) < topH {
 				topLines = append(topLines, "")
 			}
 			topLines = topLines[:topH]
 		}
+		// When HasImage() is true and kittySeq is "", the image persists in
+		// the terminal's memory from a previous frame. No kitty commands needed.
 
 		topSection := strings.Join(topLines, "\n")
 
@@ -623,9 +677,9 @@ func (m App) View() string {
 
 		full = topSection + "\n" + bottomBar
 	} else {
-		// Fallback layout: original three-column top row + full-width bottom bar.
+		// Fallback layout: navigator + cover art placeholder, full-width bottom bar.
 		bottomH := 3
-		navW := m.width - sidebarW - coverW
+		navW := m.width - coverW
 		if navW < 10 {
 			navW = 10
 		}
@@ -634,11 +688,10 @@ func (m App) View() string {
 			topH = 3
 		}
 
-		sidebarView := m.sidebar.View(sidebarW, topH, m.focused == PaneSidebar)
 		navView := m.navigator.View(navW, topH, m.focused == PaneNavigator)
 		coverView := m.coverArt.View(coverW, topH, m.focused == PaneCoverArt)
 
-		topRow := lipgloss.JoinHorizontal(lipgloss.Top, sidebarView, navView, coverView)
+		topRow := lipgloss.JoinHorizontal(lipgloss.Top, navView, coverView)
 
 		bottomBar := m.nowPlaying.View(m.width)
 		if m.statusMsg != "" {
@@ -663,16 +716,14 @@ func (m App) View() string {
 		full = m.overlayQueue(full)
 	}
 
+	// Overlay library menu if visible
+	if m.libraryVisible {
+		full = m.overlayLibrary(full)
+	}
+
 	// Overlay help if visible
 	if m.helpVisible {
 		full = m.overlayHelp(full)
-	}
-
-	// When kitty protocol is active, prepend a "delete all images" command
-	// before each frame. This clears stale image artifacts on resize or
-	// navigation. The current frame's kitty sequence re-renders the image.
-	if m.coverArt.Supported {
-		full = "\x1b_Ga=d,d=a\x1b\\" + full
 	}
 
 	return full
@@ -880,6 +931,57 @@ func (m App) overlayQueue(base string) string {
 		row := yOffset + i
 		if row < len(lines) {
 			lines[row] = strings.Repeat(" ", xOffset) + ql
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// overlayLibrary renders the library menu popup.
+func (m App) overlayLibrary(base string) string {
+	options := []string{"Favorites", "My Mixes"}
+
+	content := StyleSectionHeader.Render("LIBRARY") + "\n\n"
+
+	for i, opt := range options {
+		if i == m.libraryCursor {
+			content += StyleItemSelected.Render(" > "+opt) + "\n"
+		} else {
+			content += StyleItemNormal.Render("   "+opt) + "\n"
+		}
+	}
+
+	content += "\n" + StyleDim.Render("Enter to select, p or Esc to close")
+
+	boxW := 40
+	availW := m.width
+	if m.coverArt.Supported {
+		availW = m.width - m.coverArt.Width()
+	}
+
+	libraryBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorPrimary).
+		Padding(1, 2).
+		Width(boxW).
+		Render(content)
+
+	lines := strings.Split(base, "\n")
+	boxLines := strings.Split(libraryBox, "\n")
+
+	yOffset := (m.height - len(boxLines)) / 2
+	xOffset := (availW - boxW - 4) / 2
+	if yOffset < 0 {
+		yOffset = 0
+	}
+	if xOffset < 0 {
+		xOffset = 0
+	}
+
+	for i, bl := range boxLines {
+		row := yOffset + i
+		if row < len(lines) {
+			lines[row] = strings.Repeat(" ", xOffset) + bl
 		}
 	}
 

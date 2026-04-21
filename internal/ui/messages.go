@@ -90,6 +90,28 @@ type PlaybackFinishedMsg struct {
 // TickMsg drives the progress bar update loop (fires every second).
 type TickMsg time.Time
 
+// --- Library (Favorites / Mixes) ---
+
+// FavoritesMsg carries the user's favorited tracks.
+type FavoritesMsg struct {
+	Tracks []tidal.Track
+	Err    error
+}
+
+// MixListMsg carries the user's daily mixes.
+type MixListMsg struct {
+	Mixes []tidal.Mix
+	Err   error
+}
+
+// MixTracksMsg carries the tracks for a selected mix.
+type MixTracksMsg struct {
+	MixID    string
+	MixTitle string
+	Tracks   []tidal.Track
+	Err      error
+}
+
 // --- Cover Art ---
 
 // CoverArtMsg carries the pre-rendered cover art kitty escape sequences.
@@ -97,6 +119,7 @@ type CoverArtMsg struct {
 	CoverURL string      // for dedup
 	Rows     []string    // one kitty APC sequence per terminal row
 	Img      image.Image // cached decoded image (for re-render on resize)
+	ImageID  uint32      // persistent kitty image ID
 	Err      error
 }
 

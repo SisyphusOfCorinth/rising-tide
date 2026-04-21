@@ -13,10 +13,13 @@ import (
 type ViewKind int
 
 const (
-	ViewEmpty  ViewKind = iota // No content (initial state)
-	ViewSearch                 // Search results (tracks, albums, artists)
-	ViewArtist                 // Artist's album list
-	ViewAlbum                  // Album's track list
+	ViewEmpty   ViewKind = iota // No content (initial state)
+	ViewSearch                  // Search results (tracks, albums, artists)
+	ViewArtist                  // Artist's album list
+	ViewAlbum                   // Album's track list
+	ViewMixList                 // List of daily mixes
+	ViewMix                     // Tracks from a specific mix
+	ViewFavorites               // User's favorited tracks
 )
 
 // StackFrame captures the complete state of a navigation view so it can be
@@ -46,6 +49,7 @@ const (
 	NavItemArtist NavItemKind = iota
 	NavItemAlbum
 	NavItemTrack
+	NavItemMix    // Selectable mix entry
 	NavItemHeader // Non-selectable section header
 )
 
@@ -60,6 +64,7 @@ type NavItem struct {
 	Track  *tidal.Track
 	Album  *tidal.Album
 	Artist *tidal.Artist
+	Mix    *tidal.Mix
 }
 
 // Navigator is the central content panel implementing stack-based navigation
@@ -291,6 +296,59 @@ func (n *Navigator) SetAlbumTracks(albumTitle string, tracks []tidal.Track) {
 		Title:  albumTitle,
 		Tracks: tracks,
 		Items:  items,
+		Cursor: 0,
+	}
+
+	n.Push(frame)
+}
+
+// SetTrackList builds a generic track list (used for Favorites, Mix tracks, etc.).
+func (n *Navigator) SetTrackList(title string, kind ViewKind, tracks []tidal.Track) {
+	var items []NavItem
+
+	for i := range tracks {
+		dur := formatTime(float64(tracks[i].Duration))
+		label := fmt.Sprintf("%s - %s  %s", tracks[i].Artist.Name, tracks[i].Title, StyleDim.Render(dur))
+		items = append(items, NavItem{
+			Kind:       NavItemTrack,
+			Label:      label,
+			Selectable: true,
+			Track:      &tracks[i],
+		})
+	}
+
+	frame := StackFrame{
+		Kind:   kind,
+		Title:  title,
+		Tracks: tracks,
+		Items:  items,
+		Cursor: 0,
+	}
+
+	n.Push(frame)
+}
+
+// SetMixList builds a list of selectable mixes.
+func (n *Navigator) SetMixList(mixes []tidal.Mix) {
+	var items []NavItem
+
+	for i := range mixes {
+		label := mixes[i].Title
+		if mixes[i].SubTitle != "" {
+			label += "  " + StyleDim.Render(mixes[i].SubTitle)
+		}
+		items = append(items, NavItem{
+			Kind:       NavItemMix,
+			Label:      label,
+			Selectable: true,
+			Mix:        &mixes[i],
+		})
+	}
+
+	frame := StackFrame{
+		Kind:  ViewMixList,
+		Title: "My Mixes",
+		Items: items,
 		Cursor: 0,
 	}
 

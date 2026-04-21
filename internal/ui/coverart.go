@@ -1,9 +1,9 @@
 // Cover art display using the Kitty terminal graphics protocol.
 //
-// The image is always rendered at exactly 640x640 pixels. The terminal
-// layout adapts: the cover art panel has a fixed column/row size computed
-// from terminal cell dimensions, and the now-playing bar fills the space
-// below the sidebar+navigator to be flush with the cover art bottom edge.
+// Images are assigned persistent IDs so the terminal retains them between
+// frames. This avoids the ghost rendering bug caused by deleting and
+// re-transmitting images every frame (which exposes stale text underneath).
+// See GHOST_RENDERING_ANALYSIS.md for the full analysis.
 //
 // Supported terminals: Ghostty, Kitty, WezTerm.
 // Unsupported terminals fall back to a text placeholder panel.
@@ -25,34 +25,30 @@ import (
 // kittyChunkSize is the maximum base64 payload length per Kitty APC chunk.
 const kittyChunkSize = 4096
 
-// Cover art is always 640x640 pixels. These constants define the terminal
-// cell dimensions needed to contain that image. Ghostty/Kitty typically
-// have cells around 9x20 pixels at default font sizes.
-//
-// We use conservative estimates so the image fits within the reserved cells.
-// The Kitty protocol's c= and r= parameters reserve terminal cells, while
-// the actual image renders at native pixel size within that space.
+// Cover art is always 640x640 pixels.
 const (
-	CoverPixels = 640 // image width and height in pixels
-
-	// Terminal cell estimates. These determine how many columns/rows to
-	// reserve in the TUI layout. The actual image is always 640x640px
-	// regardless of these values -- the Kitty protocol handles scaling.
-	CellPixelW = 9
-	CellPixelH = 20
-
-	// Fixed terminal dimensions for the cover art panel.
-	CoverCols = (CoverPixels / CellPixelW) + 1 // ~72 columns
-	CoverRows = (CoverPixels / CellPixelH) + 1 // ~33 rows
+	CoverPixels = 640
+	CellPixelW  = 9
+	CellPixelH  = 20
+	CoverCols   = (CoverPixels / CellPixelW) + 1 // ~72 columns
+	CoverRows   = (CoverPixels / CellPixelH) + 1 // ~33 rows
 )
 
 // CoverArt manages album cover art display via the Kitty terminal graphics
-// protocol. The image is always rendered at exactly 640x640 pixels.
+// protocol. Images are assigned persistent IDs so the terminal retains them
+// between frames -- no delete-and-re-render cycle needed.
 type CoverArt struct {
 	Supported bool        // kitty protocol available (checked once at startup)
 	Img       image.Image // cached decoded image (for re-render on resize)
-	Rows      []string    // pre-rendered kitty escape sequences, one per row
 	CoverURL  string      // current URL (for dedup -- skip fetch if same album)
+
+	// Kitty image state. The transmitSeq is sent exactly once (the frame
+	// after CoverArtMsg arrives). On subsequent frames the image persists
+	// in the terminal's memory and no kitty commands are needed.
+	imageID    uint32 // current kitty image ID (incremented per album change)
+	transmitSeq string // kitty APC sequence to transmit the current image (sent once)
+	deleteSeq   string // kitty APC sequence to delete the PREVIOUS image (sent once)
+	placed      bool   // true after the image has been sent to the terminal
 }
 
 // NewCoverArt creates a CoverArt panel, detecting Kitty protocol support.
@@ -67,7 +63,7 @@ func (c CoverArt) Width() int {
 	if c.Supported {
 		return CoverCols
 	}
-	return 30 // placeholder width for unsupported terminals
+	return 30
 }
 
 // Height returns the fixed terminal row height for the cover art panel.
@@ -75,21 +71,76 @@ func (c CoverArt) Height() int {
 	return CoverRows
 }
 
-// Clear resets the cover art display (e.g. when playback stops).
+// Clear resets the cover art display (e.g. when queue is exhausted).
+// The old image is deleted from the terminal on the next frame via deleteSeq.
 func (c *CoverArt) Clear() {
+	if c.imageID > 0 {
+		c.deleteSeq = kittyDeleteImage(c.imageID)
+	}
 	c.Img = nil
-	c.Rows = nil
+	c.transmitSeq = ""
 	c.CoverURL = ""
+	c.placed = false
 }
 
-// View renders the cover art placeholder panel. When kitty rows are available,
-// they are appended directly to output lines in app.go's View() method rather
-// than going through lipgloss, to avoid APC escape sequence width issues.
+// SetImage installs a new cover art image. If a previous image exists, a
+// targeted delete sequence is prepared. The new image transmit sequence is
+// built and will be sent on the next View() render.
+func (c *CoverArt) SetImage(img image.Image, coverURL string, rows []string, newImageID uint32) {
+	// Delete the old image (if any) on the next frame.
+	if c.imageID > 0 && c.imageID != newImageID {
+		c.deleteSeq = kittyDeleteImage(c.imageID)
+	}
+
+	c.Img = img
+	c.CoverURL = coverURL
+	c.imageID = newImageID
+	c.placed = false
+
+	// rows[0] contains the transmit sequence; the rest are empty.
+	if len(rows) > 0 {
+		c.transmitSeq = rows[0]
+	}
+}
+
+// KittySequenceForFrame returns the kitty escape sequence(s) to include in
+// the current frame's output, or "" if the image is already placed and no
+// action is needed. After returning a non-empty string, subsequent calls
+// return "" until the image changes.
+func (c *CoverArt) KittySequenceForFrame() string {
+	var seq string
+
+	// Delete the previous image if needed.
+	if c.deleteSeq != "" {
+		seq += c.deleteSeq
+		c.deleteSeq = ""
+	}
+
+	// Transmit the new image if not yet placed.
+	if !c.placed && c.transmitSeq != "" {
+		seq += c.transmitSeq
+		c.placed = true
+	}
+
+	return seq
+}
+
+// NeedsRender returns true if the cover art has a pending transmit or delete.
+func (c CoverArt) NeedsRender() bool {
+	return c.deleteSeq != "" || (!c.placed && c.transmitSeq != "")
+}
+
+// HasImage returns true if a cover art image is currently loaded.
+func (c CoverArt) HasImage() bool {
+	return c.imageID > 0 && c.placed
+}
+
+// View renders the cover art placeholder panel (used when no image is loaded
+// or on unsupported terminals).
 func (c CoverArt) View(w, h int, focused bool) string {
 	return c.fallbackView(w, h, focused)
 }
 
-// fallbackView renders the text placeholder for unsupported terminals.
 func (c CoverArt) fallbackView(w, h int, focused bool) string {
 	innerW := w - 2
 	innerH := h - 2
@@ -109,7 +160,6 @@ func (c CoverArt) fallbackView(w, h int, focused bool) string {
 	}
 
 	content := header + "\n\n" + hint
-
 	lines := strings.Split(content, "\n")
 	for len(lines) < innerH {
 		lines = append(lines, "")
@@ -118,14 +168,13 @@ func (c CoverArt) fallbackView(w, h int, focused bool) string {
 		lines = lines[:innerH]
 	}
 	body := strings.Join(lines, "\n")
-
 	return panelStyle(innerW, innerH, focused).Render(body)
 }
 
 // --- Kitty Terminal Graphics Protocol ---
 
 // KittySupported reports whether the running terminal supports the Kitty
-// terminal graphics protocol. Ghostty, Kitty, and WezTerm qualify.
+// terminal graphics protocol.
 func KittySupported() bool {
 	switch os.Getenv("TERM_PROGRAM") {
 	case "ghostty", "WezTerm":
@@ -141,46 +190,32 @@ func KittySupported() bool {
 }
 
 // RenderKittyRows encodes a 640x640 image as a single Kitty APC sequence
-// placed on the first line, spanning cols columns and rows terminal rows.
-// The terminal renders the image as one block behind the text layer.
-// Remaining lines are empty (the caller fills them with spaces so the
-// image shows through).
-//
-// Returns a slice where index 0 has the full-image kitty sequence and all
-// other entries are empty strings.
-func RenderKittyRows(img image.Image, cols, rows int) []string {
+// with the given image ID. Returns a slice where index 0 has the sequence
+// and the rest are empty strings.
+func RenderKittyRows(img image.Image, cols, rows int, imageID uint32) []string {
 	if img == nil || cols <= 0 || rows <= 0 {
 		return nil
 	}
 
-	// Scale source image to exactly 640x640 pixels.
 	scaled := image.NewRGBA(image.Rect(0, 0, CoverPixels, CoverPixels))
 	draw.BiLinear.Scale(scaled, scaled.Bounds(), img, img.Bounds(), draw.Over, nil)
 
-	// PNG-encode the full image.
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, scaled); err != nil {
 		return nil
 	}
 
 	encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
-
-	// Build the kitty sequence for the full image: c=cols, r=rows tells the
-	// terminal to span the image over that many cells. The image renders as
-	// a graphic layer behind text.
-	seq := kittyChunkedFull(encoded, cols, rows)
+	seq := kittyChunkedFull(encoded, cols, rows, imageID)
 
 	result := make([]string, rows)
-	result[0] = seq // full image on first line
-	// Lines 1..rows-1 are empty -- spaces added by the caller let the
-	// image show through since spaces have no background.
+	result[0] = seq
 	return result
 }
 
-// kittyChunkedFull wraps base64-encoded image data for a full multi-row image.
-// Uses r={rows} so the terminal renders the image spanning multiple rows as
-// a single block, avoiding per-row strip gaps.
-func kittyChunkedFull(encoded string, cols, rows int) string {
+// kittyChunkedFull wraps base64-encoded image data for a full multi-row image
+// with a persistent image ID. The terminal retains the image in memory by ID.
+func kittyChunkedFull(encoded string, cols, rows int, imageID uint32) string {
 	var sb strings.Builder
 	for i := 0; i < len(encoded); i += kittyChunkSize {
 		end := i + kittyChunkSize
@@ -193,7 +228,10 @@ func kittyChunkedFull(encoded string, cols, rows int) string {
 			more = 0
 		}
 		if i == 0 {
-			fmt.Fprintf(&sb, "\x1b_Ga=T,f=100,c=%d,r=%d,q=2,m=%d;%s\x1b\\", cols, rows, more, chunk)
+			// i={id} assigns a persistent image ID so the terminal retains
+			// the image between frames without re-transmission.
+			fmt.Fprintf(&sb, "\x1b_Ga=T,i=%d,f=100,c=%d,r=%d,q=2,m=%d;%s\x1b\\",
+				imageID, cols, rows, more, chunk)
 		} else {
 			fmt.Fprintf(&sb, "\x1b_Gm=%d;%s\x1b\\", more, chunk)
 		}
@@ -201,25 +239,8 @@ func kittyChunkedFull(encoded string, cols, rows int) string {
 	return sb.String()
 }
 
-// kittyChunked wraps base64-encoded image data in one or more Kitty APC
-// sequences for a single-row strip. Kept for potential future use.
-func kittyChunked(encoded string, cols int) string {
-	var sb strings.Builder
-	for i := 0; i < len(encoded); i += kittyChunkSize {
-		end := i + kittyChunkSize
-		if end > len(encoded) {
-			end = len(encoded)
-		}
-		chunk := encoded[i:end]
-		more := 1
-		if end >= len(encoded) {
-			more = 0
-		}
-		if i == 0 {
-			fmt.Fprintf(&sb, "\x1b_Ga=T,f=100,c=%d,r=1,q=2,m=%d;%s\x1b\\", cols, more, chunk)
-		} else {
-			fmt.Fprintf(&sb, "\x1b_Gm=%d;%s\x1b\\", more, chunk)
-		}
-	}
-	return sb.String()
+// kittyDeleteImage returns a kitty APC sequence that deletes a specific image
+// by its ID. This is more precise than deleting all images (a=d,d=a).
+func kittyDeleteImage(imageID uint32) string {
+	return fmt.Sprintf("\x1b_Ga=d,d=i,i=%d,q=2\x1b\\", imageID)
 }

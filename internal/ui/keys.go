@@ -13,6 +13,7 @@ type KeyMap struct {
 	SkipTrack  key.Binding
 	DeviceMenu key.Binding
 	Queue      key.Binding
+	Library    key.Binding
 
 	// Pane navigation (shift+hjkl)
 	FocusLeft  key.Binding
@@ -39,6 +40,7 @@ func DefaultKeyMap() KeyMap {
 		SkipTrack:  key.NewBinding(key.WithKeys(">"), key.WithHelp(">", "skip track")),
 		DeviceMenu: key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "audio device")),
 		Queue:      key.NewBinding(key.WithKeys(";"), key.WithHelp(";", "queue")),
+		Library:    key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "library")),
 
 		FocusLeft:  key.NewBinding(key.WithKeys("H"), key.WithHelp("H", "focus left")),
 		FocusDown:  key.NewBinding(key.WithKeys("J"), key.WithHelp("J", "focus down")),
@@ -65,7 +67,7 @@ func (k KeyMap) FullHelp() [][]key.Binding {
 		{k.Search, k.Select, k.Back},
 		{k.CursorUp, k.CursorDown, k.PageUp, k.PageDown},
 		{k.FocusLeft, k.FocusRight, k.FocusUp, k.FocusDown},
-		{k.PlayPause, k.SkipTrack, k.Queue, k.DeviceMenu},
+		{k.PlayPause, k.SkipTrack, k.Queue, k.Library, k.DeviceMenu},
 		{k.Help, k.Quit},
 	}
 }

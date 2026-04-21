@@ -134,15 +134,14 @@ func listDevices() tea.Cmd {
 // Kitty terminal graphics escape sequences. Cover art URLs are public (no
 // auth needed). The image is scaled and sliced into horizontal strips, one
 // per terminal row.
-func fetchCoverArt(coverUUID string, cols, rows int) tea.Cmd {
+func fetchCoverArt(coverUUID string, cols, rows int, imageID uint32) tea.Cmd {
 	return func() tea.Msg {
 		if coverUUID == "" {
-			return CoverArtMsg{} // no cover available
+			return CoverArtMsg{}
 		}
 
 		coverURL := tidal.CoverURL(coverUUID, "640x640")
 
-		// Fetch the image from Tidal's CDN.
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Get(coverURL)
 		if err != nil {
@@ -150,33 +149,57 @@ func fetchCoverArt(coverUUID string, cols, rows int) tea.Cmd {
 		}
 		defer resp.Body.Close()
 
-		// Decode the JPEG image.
 		img, _, err := image.Decode(resp.Body)
 		if err != nil {
 			return CoverArtMsg{CoverURL: coverURL, Err: err}
 		}
 
-		// Render into kitty escape sequences, one per terminal row.
-		kittyRows := RenderKittyRows(img, cols, rows)
+		kittyRows := RenderKittyRows(img, cols, rows, imageID)
 
 		return CoverArtMsg{
 			CoverURL: coverURL,
 			Rows:     kittyRows,
 			Img:      img,
+			ImageID:  imageID,
 		}
 	}
 }
 
 // rerenderCoverArt re-encodes a cached image at new dimensions (e.g. after
 // terminal resize) without re-fetching from the network.
-func rerenderCoverArt(img image.Image, coverURL string, cols, rows int) tea.Cmd {
+func rerenderCoverArt(img image.Image, coverURL string, cols, rows int, imageID uint32) tea.Cmd {
 	return func() tea.Msg {
-		kittyRows := RenderKittyRows(img, cols, rows)
+		kittyRows := RenderKittyRows(img, cols, rows, imageID)
 		return CoverArtMsg{
 			CoverURL: coverURL,
 			Rows:     kittyRows,
 			Img:      img,
+			ImageID:  imageID,
 		}
+	}
+}
+
+// fetchFavorites retrieves the user's favorited tracks.
+func fetchFavorites(client *tidal.Client) tea.Cmd {
+	return func() tea.Msg {
+		tracks, err := client.GetFavorites(context.Background(), 100)
+		return FavoritesMsg{Tracks: tracks, Err: err}
+	}
+}
+
+// fetchMixList retrieves the user's daily mixes.
+func fetchMixList(client *tidal.Client) tea.Cmd {
+	return func() tea.Msg {
+		mixes, err := client.GetMixes(context.Background())
+		return MixListMsg{Mixes: mixes, Err: err}
+	}
+}
+
+// fetchMixTracks retrieves all tracks for a specific mix.
+func fetchMixTracks(client *tidal.Client, mixID, mixTitle string) tea.Cmd {
+	return func() tea.Msg {
+		tracks, err := client.GetMixTracks(context.Background(), mixID)
+		return MixTracksMsg{MixID: mixID, MixTitle: mixTitle, Tracks: tracks, Err: err}
 	}
 }
 
