@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/cursor"
@@ -129,11 +130,19 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ready = true
-		// Re-render cover art from cached image at new dimensions.
+		// Re-render cover art at new dimensions. Use a new image ID so
+		// SetImage() will delete the old positioned image and transmit
+		// a new one at the correct position.
 		if m.coverArt.Supported && m.coverArt.Img != nil {
-			m.coverArt.imageID++
-			m.coverArt.placed = false
-			return m, rerenderCoverArt(m.coverArt.Img, m.coverArt.CoverURL, CoverCols, CoverRows, m.coverArt.imageID)
+			nextID := m.coverArt.imageID + 1
+			// On resize, force-delete ALL images immediately. The old image
+			// is at the wrong pixel position and must be removed before the
+			// new one is placed. Use deleteAll flag to send the command on
+			// the next frame.
+			m.coverArt.deleteSeq = "\x1b_Ga=d,d=a,q=2\x1b\\"
+			m.coverArt.placed = true // so the delete fires next frame
+			m.coverArt.imageID = nextID
+			return m, rerenderCoverArt(m.coverArt.Img, m.coverArt.CoverURL, CoverCols, CoverRows, nextID)
 		}
 		return m, nil
 
@@ -234,11 +243,19 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusMsg = ""
 		cmds := []tea.Cmd{tickPlaybackProgress(), waitForPlaybackDone(m.player, m.playGeneration)}
 		// Fetch cover art if kitty is supported and this is a different album.
+		// Don't modify coverArt state here -- let SetImage() handle the
+		// delete+transmit atomically when CoverArtMsg arrives, so the old
+		// image stays visible until the new one is ready.
 		if m.coverArt.Supported {
 			newCoverURL := tidal.CoverURL(msg.Track.Album.Cover, "640x640")
 			if newCoverURL != m.coverArt.CoverURL {
-				m.coverArt.imageID++
-				cmds = append(cmds, fetchCoverArt(msg.Track.Album.Cover, CoverCols, CoverRows, m.coverArt.imageID))
+				nextID := m.coverArt.imageID + 1
+				// Set imageID immediately so HasImage() returns true. This
+				// prevents the fallback placeholder layout from rendering
+				// during the fetch, which would write text underneath the
+				// kitty image layer and cause the ghost bug.
+				m.coverArt.imageID = nextID
+				cmds = append(cmds, fetchCoverArt(msg.Track.Album.Cover, CoverCols, CoverRows, nextID))
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -647,6 +664,16 @@ func (m App) View() string {
 			// Append the kitty sequence to line 0. It renders the image as
 			// a graphic overlay spanning CoverRows x CoverCols cells.
 			topLines[0] += kittySeq
+
+			// Force BubbleTea's diff renderer to rewrite EVERY line on this
+			// transition frame. Without this, the renderer skips unchanged
+			// lines, leaving stale text in the terminal's text layer that
+			// becomes visible as a ghost when the image changes.
+			// The invisible \x1b[0m (SGR reset) + unique suffix makes each
+			// line differ from the previous frame without visible effect.
+			for i := range topLines {
+				topLines[i] += "\x1b[0m "
+			}
 		} else if !m.coverArt.HasImage() {
 			// No image loaded yet -- show the placeholder panel.
 			coverView := m.coverArt.View(coverW, topH, m.focused == PaneCoverArt)
@@ -673,6 +700,15 @@ func (m App) View() string {
 			bottomLines = append(bottomLines, "")
 		}
 		bottomLines = bottomLines[:bottomH]
+
+		// If this is a transition frame (kitty image being placed), force
+		// bottom lines to be unique too, so the full screen is rewritten.
+		if kittySeq != "" {
+			for i := range bottomLines {
+				bottomLines[i] += "\x1b[0m "
+			}
+		}
+
 		bottomBar = strings.Join(bottomLines, "\n")
 
 		full = topSection + "\n" + bottomBar
@@ -724,6 +760,38 @@ func (m App) View() string {
 	// Overlay help if visible
 	if m.helpVisible {
 		full = m.overlayHelp(full)
+	}
+
+	// DEBUG: dump ALL lines to file, check for now-playing text in top section
+	if m.coverArt.Supported && m.nowPlaying.TrackTitle != "" {
+		debugLines := strings.Split(full, "\n")
+		f, err := os.OpenFile("/tmp/rising-tide-view-debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err == nil {
+			topH := m.coverArt.Height()
+			fmt.Fprintf(f, "\n=== FRAME === total=%d height=%d topH=%d imageID=%d placed=%v track=%q\n",
+				len(debugLines), m.height, topH, m.coverArt.imageID, m.coverArt.placed, m.nowPlaying.TrackTitle)
+			// Check every line for now-playing content
+			for i, line := range debugLines {
+				hasNP := strings.Contains(line, m.nowPlaying.TrackTitle)
+				hasKitty := strings.Contains(line, "\x1b_G")
+				if hasNP || hasKitty || i == 0 || i == topH || i == topH-1 {
+					truncLine := line
+					if hasKitty {
+						if idx := strings.Index(truncLine, "\x1b_G"); idx >= 0 {
+							truncLine = truncLine[:idx] + "[KITTY@" + fmt.Sprint(idx) + "]"
+						}
+					}
+					if len(truncLine) > 200 {
+						truncLine = truncLine[:200]
+					}
+					tag := ""
+					if hasNP { tag += " **HAS_TRACK_TITLE**" }
+					if hasKitty { tag += " [has_kitty]" }
+					fmt.Fprintf(f, "  line[%d]%s: %q\n", i, tag, truncLine)
+				}
+			}
+			f.Close()
+		}
 	}
 
 	return full

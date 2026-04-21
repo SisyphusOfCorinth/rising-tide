@@ -45,7 +45,8 @@ type CoverArt struct {
 	// Kitty image state. The transmitSeq is sent exactly once (the frame
 	// after CoverArtMsg arrives). On subsequent frames the image persists
 	// in the terminal's memory and no kitty commands are needed.
-	imageID    uint32 // current kitty image ID (incremented per album change)
+	imageID     uint32 // current kitty image ID (incremented per album change)
+	prevImageID uint32 // previous image ID that needs to be deleted
 	transmitSeq string // kitty APC sequence to transmit the current image (sent once)
 	deleteSeq   string // kitty APC sequence to delete the PREVIOUS image (sent once)
 	placed      bool   // true after the image has been sent to the terminal
@@ -74,12 +75,14 @@ func (c CoverArt) Height() int {
 // Clear resets the cover art display (e.g. when queue is exhausted).
 // The old image is deleted from the terminal on the next frame via deleteSeq.
 func (c *CoverArt) Clear() {
-	if c.imageID > 0 {
-		c.deleteSeq = kittyDeleteImage(c.imageID)
+	if c.prevImageID > 0 {
+		c.deleteSeq = kittyDeleteImage(c.prevImageID)
 	}
 	c.Img = nil
 	c.transmitSeq = ""
 	c.CoverURL = ""
+	c.imageID = 0
+	c.prevImageID = 0
 	c.placed = false
 }
 
@@ -87,9 +90,9 @@ func (c *CoverArt) Clear() {
 // targeted delete sequence is prepared. The new image transmit sequence is
 // built and will be sent on the next View() render.
 func (c *CoverArt) SetImage(img image.Image, coverURL string, rows []string, newImageID uint32) {
-	// Delete the old image (if any) on the next frame.
-	if c.imageID > 0 && c.imageID != newImageID {
-		c.deleteSeq = kittyDeleteImage(c.imageID)
+	// Delete the previous image (if any) on the next frame.
+	if c.prevImageID > 0 && c.prevImageID != newImageID {
+		c.deleteSeq = kittyDeleteImage(c.prevImageID)
 	}
 
 	c.Img = img
@@ -97,7 +100,6 @@ func (c *CoverArt) SetImage(img image.Image, coverURL string, rows []string, new
 	c.imageID = newImageID
 	c.placed = false
 
-	// rows[0] contains the transmit sequence; the rest are empty.
 	if len(rows) > 0 {
 		c.transmitSeq = rows[0]
 	}
@@ -107,22 +109,34 @@ func (c *CoverArt) SetImage(img image.Image, coverURL string, rows []string, new
 // the current frame's output, or "" if the image is already placed and no
 // action is needed. After returning a non-empty string, subsequent calls
 // return "" until the image changes.
+//
+// Returns the kitty escape sequence(s) for this frame.
+//
+// On the transmit frame: sends the new image ONLY (no delete). Both old
+// and new images coexist -- the new one covers the old one visually.
+// On the NEXT frame: sends the delete for the old image. By this point
+// BubbleTea has fully written all text rows, so the terminal repaint
+// triggered by the delete uses fresh text content (no ghost).
 func (c *CoverArt) KittySequenceForFrame() string {
-	var seq string
-
-	// Delete the previous image if needed.
-	if c.deleteSeq != "" {
-		seq += c.deleteSeq
+	// If we have a pending delete AND the new image is already placed,
+	// it's safe to delete the old image now (text layer is fresh from
+	// the previous full-rewrite frame).
+	if c.deleteSeq != "" && c.placed {
+		seq := c.deleteSeq
 		c.deleteSeq = ""
+		return seq
 	}
 
-	// Transmit the new image if not yet placed.
+	// Transmit the new image. The delete of the old image will happen
+	// on the NEXT frame after the text layer has been fully rewritten.
 	if !c.placed && c.transmitSeq != "" {
-		seq += c.transmitSeq
+		seq := c.transmitSeq
 		c.placed = true
+		c.prevImageID = c.imageID
+		return seq
 	}
 
-	return seq
+	return ""
 }
 
 // NeedsRender returns true if the cover art has a pending transmit or delete.
@@ -130,9 +144,12 @@ func (c CoverArt) NeedsRender() bool {
 	return c.deleteSeq != "" || (!c.placed && c.transmitSeq != "")
 }
 
-// HasImage returns true if a cover art image is currently loaded.
+// HasImage returns true if a cover art image is currently displayed in the
+// terminal (or was previously displayed and a new one is being fetched).
+// This prevents falling back to the placeholder layout during album
+// transitions, which would write text underneath the kitty image layer.
 func (c CoverArt) HasImage() bool {
-	return c.imageID > 0 && c.placed
+	return c.imageID > 0
 }
 
 // View renders the cover art placeholder panel (used when no image is loaded
