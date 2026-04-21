@@ -2,7 +2,6 @@ package ui
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/cursor"
@@ -135,14 +134,16 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// a new one at the correct position.
 		if m.coverArt.Supported && m.coverArt.Img != nil {
 			nextID := m.coverArt.imageID + 1
-			// On resize, force-delete ALL images immediately. The old image
-			// is at the wrong pixel position and must be removed before the
-			// new one is placed. Use deleteAll flag to send the command on
-			// the next frame.
-			m.coverArt.deleteSeq = "\x1b_Ga=d,d=a,q=2\x1b\\"
-			m.coverArt.placed = true // so the delete fires next frame
+			// On resize, clear everything and re-render. ClearScreen wipes
+			// the terminal (including stale images at wrong positions), and
+			// rerenderCoverArt produces a fresh CoverArtMsg that SetImage
+			// will install on the next frame.
 			m.coverArt.imageID = nextID
-			return m, rerenderCoverArt(m.coverArt.Img, m.coverArt.CoverURL, CoverCols, CoverRows, nextID)
+			m.coverArt.placed = false
+			m.coverArt.transmitSeq = ""
+			m.coverArt.deleteSeq = ""
+			clearCmd := func() tea.Msg { return tea.ClearScreen() }
+			return m, tea.Batch(clearCmd, rerenderCoverArt(m.coverArt.Img, m.coverArt.CoverURL, CoverCols, CoverRows, nextID))
 		}
 		return m, nil
 
@@ -750,38 +751,6 @@ func (m App) View() string {
 	// Overlay help if visible
 	if m.helpVisible {
 		full = m.overlayHelp(full)
-	}
-
-	// DEBUG: dump ALL lines to file, check for now-playing text in top section
-	if m.coverArt.Supported && m.nowPlaying.TrackTitle != "" {
-		debugLines := strings.Split(full, "\n")
-		f, err := os.OpenFile("/tmp/rising-tide-view-debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err == nil {
-			topH := m.coverArt.Height()
-			fmt.Fprintf(f, "\n=== FRAME === total=%d height=%d topH=%d imageID=%d placed=%v track=%q\n",
-				len(debugLines), m.height, topH, m.coverArt.imageID, m.coverArt.placed, m.nowPlaying.TrackTitle)
-			// Check every line for now-playing content
-			for i, line := range debugLines {
-				hasNP := strings.Contains(line, m.nowPlaying.TrackTitle)
-				hasKitty := strings.Contains(line, "\x1b_G")
-				if hasNP || hasKitty || i == 0 || i == topH || i == topH-1 {
-					truncLine := line
-					if hasKitty {
-						if idx := strings.Index(truncLine, "\x1b_G"); idx >= 0 {
-							truncLine = truncLine[:idx] + "[KITTY@" + fmt.Sprint(idx) + "]"
-						}
-					}
-					if len(truncLine) > 200 {
-						truncLine = truncLine[:200]
-					}
-					tag := ""
-					if hasNP { tag += " **HAS_TRACK_TITLE**" }
-					if hasKitty { tag += " [has_kitty]" }
-					fmt.Fprintf(f, "  line[%d]%s: %q\n", i, tag, truncLine)
-				}
-			}
-			f.Close()
-		}
 	}
 
 	return full
