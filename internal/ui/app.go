@@ -231,13 +231,13 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	// --- Playback messages ---
-	case StreamURLMsg:
+	case StreamReadyMsg:
 		if msg.Err != nil {
 			m.nowPlaying.Clear()
 			m.statusMsg = fmt.Sprintf("Stream error: %v", msg.Err)
 			return m, nil
 		}
-		return m, startPlayback(m.player, msg.Track, msg.URL)
+		return m, startPlayback(m.player, msg.Track, msg.Opener)
 
 	case PlaybackStartedMsg:
 		m.nowPlaying.SetTrack(msg.Track.Title, msg.Track.Artist.Name, msg.Track.Album.Title)

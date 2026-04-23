@@ -2,7 +2,9 @@ package tidal_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -204,74 +206,156 @@ func TestSearch_Empty(t *testing.T) {
 	}
 }
 
-// --- GetStreamURL ---
+// --- OpenStream ---
+//
+// These tests model the /playbackinfopostpaywall endpoint: the server returns
+// a JSON envelope with a base64-encoded manifest, and the manifest carries an
+// explicit codec plus the playable URL(s). OpenStream walks the quality
+// ladder (HI_RES_LOSSLESS -> LOSSLESS -> HIGH -> LOW), rejecting tiers where
+// the server silently returned a lossy codec for a lossless request, and
+// returns an io.ReadCloser over the chosen stream's body.
+//
+// The tests distinguish which tier won by giving each tier's stream path a
+// unique body and reading the returned body.
 
-func TestGetStreamURL_FirstQualitySucceeds(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("audioquality")
-		if q == "HI_RES_LOSSLESS" {
-			respond(w, 200, tidal.StreamResponse{URLs: []string{"https://cdn.tidal.com/stream.flac"}})
-			return
-		}
-		respond(w, 404, map[string]string{"error": "not found"})
-	}))
-	defer srv.Close()
-
-	u, err := newTestClient(srv).GetStreamURL(context.Background(), 123)
-	if err != nil {
-		t.Fatal(err)
+// playbackInfoBody builds a fake /playbackinfopostpaywall JSON response with
+// a base64-encoded vnd.tidal.bt manifest carrying the given codec and URL.
+func playbackInfoBody(codec, streamURL string) map[string]any {
+	manifest := map[string]any{
+		"mimeType":       "audio/mp4",
+		"codecs":         codec,
+		"encryptionType": "NONE",
+		"urls":           []string{streamURL},
 	}
-	if u != "https://cdn.tidal.com/stream.flac" {
-		t.Errorf("unexpected URL: %s", u)
+	raw, _ := json.Marshal(manifest)
+	return map[string]any{
+		"trackId":          123,
+		"audioQuality":     "LOSSLESS",
+		"manifestMimeType": "application/vnd.tidal.bt",
+		"manifest":         base64.StdEncoding.EncodeToString(raw),
 	}
 }
 
-func TestGetStreamURL_FallsBackThroughQualities(t *testing.T) {
-	var seen []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("audioquality")
-		seen = append(seen, q)
-		if q == "LOSSLESS" {
-			respond(w, 200, tidal.StreamResponse{URLs: []string{"https://cdn.tidal.com/lossless.flac"}})
-			return
-		}
-		respond(w, 404, map[string]string{"error": "not found"})
-	}))
-	defer srv.Close()
-
-	u, err := newTestClient(srv).GetStreamURL(context.Background(), 123)
+// readStreamString opens a stream, reads the entire body to a string, and
+// closes. Useful for asserting which CDN URL the client followed.
+func readStreamString(t *testing.T, c *tidal.Client) string {
+	t.Helper()
+	rc, err := c.OpenStream(context.Background(), 123)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u != "https://cdn.tidal.com/lossless.flac" {
-		t.Errorf("unexpected URL: %s", u)
+	defer func() { _ = rc.Close() }()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func TestOpenStream_FirstQualitySucceeds(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/playbackinfopostpaywall") {
+			if r.URL.Query().Get("audioquality") == "HI_RES_LOSSLESS" {
+				respond(w, 200, playbackInfoBody("flac", srv.URL+"/stream/hires"))
+				return
+			}
+			respond(w, 404, map[string]string{"error": "not found"})
+			return
+		}
+		if r.URL.Path == "/stream/hires" {
+			_, _ = w.Write([]byte("hires-flac-bytes"))
+			return
+		}
+	}))
+	defer srv.Close()
+
+	if got := readStreamString(t, newTestClient(srv)); got != "hires-flac-bytes" {
+		t.Errorf("unexpected stream body: %q", got)
+	}
+}
+
+func TestOpenStream_FallsBackThroughQualities(t *testing.T) {
+	var seen []string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/playbackinfopostpaywall") {
+			q := r.URL.Query().Get("audioquality")
+			seen = append(seen, q)
+			if q == "LOSSLESS" {
+				respond(w, 200, playbackInfoBody("flac", srv.URL+"/stream/lossless"))
+				return
+			}
+			respond(w, 404, map[string]string{"error": "not found"})
+			return
+		}
+		if r.URL.Path == "/stream/lossless" {
+			_, _ = w.Write([]byte("lossless-flac-bytes"))
+			return
+		}
+	}))
+	defer srv.Close()
+
+	if got := readStreamString(t, newTestClient(srv)); got != "lossless-flac-bytes" {
+		t.Errorf("unexpected stream body: %q", got)
 	}
 	if len(seen) < 2 || seen[0] != "HI_RES_LOSSLESS" || seen[1] != "LOSSLESS" {
 		t.Errorf("unexpected quality ladder: %v", seen)
 	}
 }
 
-func TestGetStreamURL_AllQualitiesFail(t *testing.T) {
+func TestOpenStream_AllQualitiesFail(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		respond(w, 404, map[string]string{"error": "not found"})
 	}))
 	defer srv.Close()
 
-	_, err := newTestClient(srv).GetStreamURL(context.Background(), 123)
+	_, err := newTestClient(srv).OpenStream(context.Background(), 123)
 	if err == nil {
 		t.Fatal("expected error when all qualities fail")
 	}
 }
 
-func TestGetStreamURL_EmptyURLs(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		respond(w, 200, tidal.StreamResponse{URLs: []string{}})
+// TestOpenStream_RejectsSilentAACDowngrade exercises the behaviour that broke
+// playback against real Tidal servers: when a LOSSLESS request is answered
+// 200 OK with an AAC manifest, the client must treat that as a rejection
+// and try the next tier rather than play back degraded audio.
+func TestOpenStream_RejectsSilentAACDowngrade(t *testing.T) {
+	var seen []string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/playbackinfopostpaywall") {
+			q := r.URL.Query().Get("audioquality")
+			seen = append(seen, q)
+			switch q {
+			case "HI_RES_LOSSLESS", "LOSSLESS":
+				// Simulate Tidal's downgrade bug: 200 OK, but codec is AAC.
+				respond(w, 200, playbackInfoBody("mp4a.40.2", srv.URL+"/stream/aac-downgraded"))
+			case "HIGH":
+				// HIGH is legitimately AAC, so accept it.
+				respond(w, 200, playbackInfoBody("mp4a.40.2", srv.URL+"/stream/high"))
+			default:
+				respond(w, 404, map[string]string{"error": "not found"})
+			}
+			return
+		}
+		if r.URL.Path == "/stream/high" {
+			_, _ = w.Write([]byte("high-aac-bytes"))
+			return
+		}
+		// Any hit on /stream/aac-downgraded would indicate a test failure,
+		// because the lossless tiers should never have followed the URL.
+		if r.URL.Path == "/stream/aac-downgraded" {
+			t.Errorf("downgraded AAC stream body was fetched -- ladder should have skipped it")
+		}
 	}))
 	defer srv.Close()
 
-	_, err := newTestClient(srv).GetStreamURL(context.Background(), 123)
-	if err == nil {
-		t.Fatal("expected error for empty URLs in response")
+	if got := readStreamString(t, newTestClient(srv)); got != "high-aac-bytes" {
+		t.Errorf("expected HIGH-tier body, got %q", got)
+	}
+	if len(seen) < 3 {
+		t.Errorf("expected at least three quality attempts, saw %v", seen)
 	}
 }
 

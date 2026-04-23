@@ -150,11 +150,12 @@ fail:
 import "C"
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -246,32 +247,39 @@ func ListDevices() ([]DeviceInfo, error) {
 	return devices, nil
 }
 
+// StreamOpener opens a fresh audio byte stream for a single track. It may be
+// called more than once per track -- once for initial playback, and again if
+// the user seeks (the loop reopens the stream from the start and skips
+// forward to the target). Implementations are responsible for any auth,
+// manifest resolution, and HTTP fetching; the player just reads bytes and
+// closes the returned ReadCloser when done.
+type StreamOpener func(ctx context.Context) (io.ReadCloser, error)
+
 // Player manages ALSA playback of FLAC streams from Tidal's CDN.
 //
 // Concurrency model:
 //   - sync.Mutex protects mutable state (cancel, doneCh, skipCh, etc.)
 //   - sync.RWMutex protects track info (sampleRate, channels, etc.)
 //   - atomic operations for hot-path data (samplesPlayed, paused, volume)
-//   - Channels for cross-goroutine signaling (seekCh, nextURLCh, skipCh)
+//   - Channels for cross-goroutine signaling (seekCh, nextOpenerCh, skipCh)
 type Player struct {
 	mu             sync.Mutex
 	cancel         context.CancelFunc
 	doneCh         chan struct{}
 	deviceOverride string // set via SetDevice; empty = auto-detect
-	currentURL     string // stored so Seek can signal the playback loop
 
 	// seekCh carries seek targets (in samples) to the running playback loop.
 	// Buffered 1 so Seek never blocks; the loop drains it before checking again.
 	seekCh chan uint64
 
-	// nextURLCh carries the next track's stream URL into the running
+	// nextOpenerCh carries the next track's stream opener into the running
 	// playbackLoop so it can transition without closing the ALSA device.
-	nextURLCh chan string
-	// transitionDoneCh is set by PlayNext() before sending on nextURLCh.
+	nextOpenerCh chan StreamOpener
+	// transitionDoneCh is set by PlayNext() before sending on nextOpenerCh.
 	// The playbackLoop installs it as the new doneCh once the new stream starts.
 	transitionDoneCh chan struct{}
 	// skipCh is closed by PlayNext to interrupt the current streamLoop
-	// immediately, so the outer loop can pick up the next URL without
+	// immediately, so the outer loop can pick up the next opener without
 	// waiting for the current track to finish.
 	skipCh chan struct{}
 	// loopDone is closed when the playbackLoop goroutine returns.
@@ -314,9 +322,9 @@ func (p *Player) getDevice() (string, error) {
 // opened until Play is called.
 func NewPlayer() *Player {
 	p := &Player{
-		seekCh:    make(chan uint64, 1),
-		nextURLCh: make(chan string, 1),
-		skipCh:    make(chan struct{}),
+		seekCh:       make(chan uint64, 1),
+		nextOpenerCh: make(chan StreamOpener, 1),
+		skipCh:       make(chan struct{}),
 	}
 	atomic.StoreUint64(&p.volumeBits, math.Float64bits(1.0))
 	return p
@@ -463,9 +471,13 @@ func isHWDevice(device string) bool {
 	return strings.HasPrefix(device, "hw:") || strings.HasPrefix(device, "plughw:")
 }
 
-// Play starts playback of the given URL and returns the done channel for this
-// track. The channel is closed when playback finishes naturally.
-func (p *Player) Play(url string) (<-chan struct{}, error) {
+// Play starts playback of the stream produced by opener and returns the done
+// channel for this track. The channel is closed when playback finishes
+// naturally. The opener may be invoked more than once: initial read, and on
+// every seek (the loop restarts the stream and skips forward to the target
+// sample offset, since the HTTP side doesn't expose byte-range seeking over
+// an arbitrary audio bytestream).
+func (p *Player) Play(opener StreamOpener) (<-chan struct{}, error) {
 	p.stop()
 
 	device, err := p.getDevice()
@@ -497,25 +509,24 @@ func (p *Player) Play(url string) (<-chan struct{}, error) {
 	p.cancel = cancel
 	p.doneCh = doneCh
 	p.loopDone = loopDone
-	p.currentURL = url
 	p.skipCh = make(chan struct{})
 	p.mu.Unlock()
 
 	atomic.StoreUint64(&p.samplesPlayed, 0)
 	atomic.StoreUint32(&p.paused, 0)
-	// Drain any pending seek/next-URL so the new track starts cleanly.
+	// Drain any pending seek/next-opener so the new track starts cleanly.
 	select {
 	case <-p.seekCh:
 	default:
 	}
 	select {
-	case <-p.nextURLCh:
+	case <-p.nextOpenerCh:
 	default:
 	}
 
 	go func() {
 		defer close(loopDone)
-		p.playbackLoop(ctx, url, device, releaseReservation)
+		p.playbackLoop(ctx, opener, device, releaseReservation)
 		p.mu.Lock()
 		ch := p.doneCh
 		p.doneCh = nil
@@ -546,21 +557,22 @@ func (p *Player) stop() {
 	}
 }
 
-// PlayNext signals the running playbackLoop to transition to a new track URL
-// without closing the ALSA device. If the new track has a different format
-// (sample rate, channels, bits), the loop will close and reopen the device
-// internally. If no playback loop is running, it falls back to Play().
-func (p *Player) PlayNext(url string) (<-chan struct{}, error) {
+// PlayNext signals the running playbackLoop to transition to the next track
+// by swapping in a new stream opener, without closing the ALSA device. If
+// the new track has a different format (sample rate, channels, bits), the
+// loop will close and reopen the device internally. If no playback loop is
+// running, it falls back to Play().
+func (p *Player) PlayNext(opener StreamOpener) (<-chan struct{}, error) {
 	p.mu.Lock()
 	loopDone := p.loopDone
 	p.mu.Unlock()
 
 	if loopDone == nil {
-		return p.Play(url)
+		return p.Play(opener)
 	}
 	select {
 	case <-loopDone:
-		return p.Play(url)
+		return p.Play(opener)
 	default:
 	}
 
@@ -573,32 +585,60 @@ func (p *Player) PlayNext(url string) (<-chan struct{}, error) {
 	p.mu.Unlock()
 
 	select {
-	case <-p.nextURLCh:
+	case <-p.nextOpenerCh:
 	default:
 	}
-	p.nextURLCh <- url
+	p.nextOpenerCh <- opener
 
 	atomic.StoreUint32(&p.paused, 0)
 
 	return newDone, nil
 }
 
-// openStream fetches the FLAC HTTP stream and returns the response and decoder.
-func openStream(ctx context.Context, url string) (*http.Response, *flac.Stream, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+// openStream invokes the supplied opener and returns the underlying body
+// alongside a FLAC decoder positioned at the first audio frame. Tidal
+// delivers either raw FLAC or FLAC-in-MP4 depending on quality tier and
+// delivery rollout; we sniff the first four bytes and, if the body is
+// MP4/ISOBMFF, demux it on the fly so the decoder always sees a raw FLAC
+// bytestream. The caller owns the returned ReadCloser and must close it
+// when playback for this stream ends.
+func openStream(ctx context.Context, opener StreamOpener) (io.ReadCloser, *flac.Stream, error) {
+	body, err := opener(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+
+	audio, err := unwrapFlacStream(body)
 	if err != nil {
+		_ = body.Close()
 		return nil, nil, err
 	}
-	stream, err := flac.New(resp.Body)
+
+	stream, err := flac.New(audio)
 	if err != nil {
-		_ = resp.Body.Close()
+		_ = body.Close()
 		return nil, nil, err
 	}
-	return resp, stream, nil
+	return body, stream, nil
+}
+
+// unwrapFlacStream peeks the first four bytes of the HTTP body and returns
+// either the body unchanged (raw FLAC, "fLaC" magic) or a reader that
+// streams the demuxed FLAC out of an MP4 container. Closing the HTTP body
+// cascades: for the MP4 case, the demux goroutine's reads on the body error
+// out, propagating through the io.Pipe to the FLAC decoder -- so the usual
+// cleanup path (resp.Body.Close in playbackLoop) still tears everything down.
+func unwrapFlacStream(body io.Reader) (io.Reader, error) {
+	br := bufio.NewReader(body)
+	magic, err := br.Peek(4)
+	if err != nil {
+		return nil, fmt.Errorf("sniff stream header: %w", err)
+	}
+	if string(magic) == "fLaC" {
+		return br, nil
+	}
+	logger.L.Debug("wrapping stream with MP4 demuxer", "magic", fmt.Sprintf("%x", magic))
+	return FlacFromMp4Reader(br), nil
 }
 
 // closeALSA drains and closes an ALSA handle.
@@ -609,9 +649,11 @@ func closeALSA(ah *alsaHandle) {
 
 // playbackLoop is the main playback goroutine. It manages the ALSA device
 // lifetime, FLAC decoding, PCM writing, pause/resume, seek, and gapless
-// track transitions.
-func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseReservation func()) {
-	logger.L.Debug("playbackLoop start", "url", url, "device", device)
+// track transitions. It owns the stream body: every call to openStream
+// yields a fresh body that must be closed exactly once when that stream
+// phase (initial play, post-seek, or post-transition) ends.
+func (p *Player) playbackLoop(ctx context.Context, opener StreamOpener, device string, releaseReservation func()) {
+	logger.L.Debug("playbackLoop start", "device", device)
 
 	// For hw: devices we need the card number for D-Bus reservation on
 	// pause/resume. For non-hw devices (default, pulse, etc.) we skip it.
@@ -627,18 +669,12 @@ func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseRe
 		}
 	}
 
-	resp, stream, err := openStream(ctx, url)
+	body, stream, err := openStream(ctx, opener)
 	if err != nil {
 		logger.L.Error("failed to open stream", "err", err)
 		releaseReservation()
 		return
 	}
-
-	logger.L.Debug("HTTP response",
-		"status", resp.StatusCode,
-		"content-type", resp.Header.Get("Content-Type"),
-		"content-length", resp.Header.Get("Content-Length"),
-	)
 
 	info := stream.Info
 	sampleRate := info.SampleRate
@@ -698,7 +734,15 @@ func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseRe
 		"buffer_size", ah.bufferSize,
 	)
 	defer func() {
-		closeALSA(ah)
+		// ah is nil-ed by the pause path once ALSA is released so other apps
+		// can use the DAC. If the loop then exits via ctx cancellation (e.g.
+		// the user skipped while paused), we must not double-close -- that
+		// segfaults in snd_pcm_drain against a freed handle. Same reasoning
+		// for releaseReservation: the pause path replaces it with a no-op
+		// after releasing.
+		if ah != nil {
+			closeALSA(ah)
+		}
 		releaseReservation()
 	}()
 
@@ -820,10 +864,16 @@ func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseRe
 				}
 
 				// Pause: release the ALSA device so other apps can use the DAC.
+				// After the release, ah and releaseReservation are cleared so
+				// the deferred cleanup (and any mid-pause exit paths) don't
+				// double-close/double-release -- both are reassigned when the
+				// device is reacquired on resume or pause+seek.
 				if atomic.LoadUint32(&p.paused) == 1 {
 					C.snd_pcm_drop(ah.pcm)
 					closeALSA(ah)
 					releaseReservation()
+					ah = nil
+					releaseReservation = func() {}
 					logger.L.Debug("paused: ALSA device released")
 
 					for atomic.LoadUint32(&p.paused) == 1 {
@@ -901,14 +951,14 @@ func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseRe
 		return 0, false
 	}
 
-	// Outer loop: play the current stream, then wait for a next-track URL
+	// Outer loop: play the current stream, then wait for a next-track opener
 	// or exit. This keeps the ALSA device open between consecutive tracks
 	// for gapless playback.
 	for {
 		seekTarget, doSeek := streamLoop(0)
 		for doSeek {
-			_ = resp.Body.Close()
-			resp, stream, err = openStream(ctx, url)
+			_ = body.Close()
+			body, stream, err = openStream(ctx, opener)
 			if err != nil {
 				logger.L.Error("failed to reopen stream for seek", "err", err)
 				return
@@ -916,7 +966,7 @@ func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseRe
 			seekTarget, doSeek = streamLoop(seekTarget)
 		}
 
-		_ = resp.Body.Close()
+		_ = body.Close()
 
 		p.mu.Lock()
 		oldDone := p.doneCh
@@ -926,13 +976,13 @@ func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseRe
 			close(oldDone)
 		}
 
-		// Wait for next track URL or exit.
+		// Wait for next-track opener or exit.
 		select {
-		case nextURL := <-p.nextURLCh:
-			logger.L.Debug("transitioning to next track", "url", nextURL)
-			url = nextURL
+		case nextOpener := <-p.nextOpenerCh:
+			logger.L.Debug("transitioning to next track")
+			opener = nextOpener
 
-			resp, stream, err = openStream(ctx, nextURL)
+			body, stream, err = openStream(ctx, opener)
 			if err != nil {
 				logger.L.Error("failed to open next stream", "err", err)
 				return
@@ -953,7 +1003,7 @@ func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseRe
 				ah, err = openALSA(device, channels, sampleRate, bits)
 				if err != nil {
 					logger.L.Error("openALSA failed for next track", "err", err)
-					_ = resp.Body.Close()
+					_ = body.Close()
 					return
 				}
 				bps = ah.bytesPerSample
@@ -997,7 +1047,6 @@ func (p *Player) playbackLoop(ctx context.Context, url, device string, releaseRe
 			p.mu.Lock()
 			p.doneCh = p.transitionDoneCh
 			p.transitionDoneCh = nil
-			p.currentURL = nextURL
 			p.mu.Unlock()
 
 			logger.L.Debug("FLAC stream (next track)",

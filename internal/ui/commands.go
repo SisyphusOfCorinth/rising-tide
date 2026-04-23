@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"image"
 	_ "image/jpeg" // register JPEG decoder for cover art
+	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -79,21 +81,49 @@ func fetchAlbumTracks(client *tidal.Client, albumID int, albumTitle string) tea.
 	}
 }
 
-// resolveAndPlay gets the stream URL for a track via the quality ladder.
+// resolveAndPlay resolves the Tidal manifest for a track and opens the first
+// byte of its audio stream. Doing the open synchronously (rather than inside
+// the player's goroutine) gives the UI a chance to show a concrete error
+// for resolution failures instead of silently cascading-skip when a track
+// turns out to be unavailable.
+//
+// On success, it hands back an opener closure that serves the already-open
+// body on its first call and re-resolves via the Tidal client on any
+// subsequent call; the player needs that re-open capability to implement
+// seek (the audio stream itself isn't random-access, so seek is
+// restart-from-zero + skip-forward-to-target).
 func resolveAndPlay(client *tidal.Client, track tidal.Track) tea.Cmd {
 	return func() tea.Msg {
-		url, err := client.GetStreamURL(context.Background(), track.ID)
+		body, err := client.OpenStream(context.Background(), track.ID)
 		if err != nil {
-			return StreamURLMsg{Track: track, Err: err}
+			return StreamReadyMsg{Track: track, Err: err}
 		}
-		return StreamURLMsg{Track: track, URL: url}
+		return StreamReadyMsg{Track: track, Opener: cachedOpener(client, track.ID, body)}
 	}
 }
 
-// startPlayback sends the URL to the player.
-func startPlayback(p *player.Player, track tidal.Track, url string) tea.Cmd {
+// cachedOpener returns a StreamOpener that yields the supplied already-open
+// body exactly once, then delegates to Tidal for any further opens. It is
+// safe for concurrent invocation -- the handoff happens under a mutex --
+// though in practice the player calls it sequentially.
+func cachedOpener(client *tidal.Client, trackID int, first io.ReadCloser) player.StreamOpener {
+	var mu sync.Mutex
+	return func(ctx context.Context) (io.ReadCloser, error) {
+		mu.Lock()
+		cached := first
+		first = nil
+		mu.Unlock()
+		if cached != nil {
+			return cached, nil
+		}
+		return client.OpenStream(ctx, trackID)
+	}
+}
+
+// startPlayback hands the opener to the player and reports the outcome.
+func startPlayback(p *player.Player, track tidal.Track, opener player.StreamOpener) tea.Cmd {
 	return func() tea.Msg {
-		_, err := p.Play(url)
+		_, err := p.Play(opener)
 		if err != nil {
 			return PlaybackErrorMsg{Err: err}
 		}

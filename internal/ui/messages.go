@@ -63,11 +63,15 @@ type AlbumTracksMsg struct {
 
 // --- Playback ---
 
-// StreamURLMsg carries the resolved CDN URL for a track.
-type StreamURLMsg struct {
-	Track tidal.Track
-	URL   string
-	Err   error
+// StreamReadyMsg is fired after the Tidal client has resolved a track's
+// playback manifest and opened the first byte of its audio stream. The
+// Opener returns the already-open body on its first invocation and
+// re-resolves via the Tidal client on subsequent invocations (used by the
+// player when seeking).
+type StreamReadyMsg struct {
+	Track  tidal.Track
+	Opener player.StreamOpener
+	Err    error
 }
 
 // PlaybackStartedMsg signals that audio playback has begun.
