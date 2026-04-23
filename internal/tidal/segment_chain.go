@@ -109,9 +109,14 @@ func (r *segmentChainReader) openNext() error {
 	return nil
 }
 
-// Close releases the in-flight body (if any). It's idempotent. Remaining
-// URLs that were never opened don't need explicit cleanup.
+// Close releases the in-flight body (if any) and marks the reader terminated
+// so a subsequent goroutine still in Read() gives up instead of fetching
+// more segments. It's safe (and expected) to call multiple times -- the
+// player's ctx-watcher and the playbackLoop's explicit close can both fire.
 func (r *segmentChainReader) Close() error {
+	if r.err == nil {
+		r.err = io.ErrClosedPipe
+	}
 	if r.body != nil {
 		err := r.body.Close()
 		r.body = nil

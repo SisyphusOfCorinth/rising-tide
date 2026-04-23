@@ -240,7 +240,7 @@ func playbackInfoBody(codec, streamURL string) map[string]any {
 // closes. Useful for asserting which CDN URL the client followed.
 func readStreamString(t *testing.T, c *tidal.Client) string {
 	t.Helper()
-	rc, err := c.OpenStream(context.Background(), 123)
+	rc, _, err := c.OpenStream(context.Background(), 123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,52 +310,40 @@ func TestOpenStream_AllQualitiesFail(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newTestClient(srv).OpenStream(context.Background(), 123)
+	_, _, err := newTestClient(srv).OpenStream(context.Background(), 123)
 	if err == nil {
 		t.Fatal("expected error when all qualities fail")
 	}
 }
 
-// TestOpenStream_RejectsSilentAACDowngrade exercises the behaviour that broke
-// playback against real Tidal servers: when a LOSSLESS request is answered
-// 200 OK with an AAC manifest, the client must treat that as a rejection
-// and try the next tier rather than play back degraded audio.
-func TestOpenStream_RejectsSilentAACDowngrade(t *testing.T) {
+// TestOpenStream_AcceptsHighestTierRegardlessOfCodec confirms we no longer
+// reject AAC at lossless tiers: if Tidal serves AAC at HI_RES (because the
+// track has no FLAC master), we take it at that tier rather than walking
+// the ladder. The downstream transcode layer is responsible for turning
+// AAC into FLAC; that layer isn't exercised here because it shells out to
+// ffmpeg and this test only validates the quality-selection logic.
+func TestOpenStream_AcceptsHighestTierRegardlessOfCodec(t *testing.T) {
 	var seen []string
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/playbackinfopostpaywall") {
 			q := r.URL.Query().Get("audioquality")
 			seen = append(seen, q)
-			switch q {
-			case "HI_RES_LOSSLESS", "LOSSLESS":
-				// Simulate Tidal's downgrade bug: 200 OK, but codec is AAC.
-				respond(w, 200, playbackInfoBody("mp4a.40.2", srv.URL+"/stream/aac-downgraded"))
-			case "HIGH":
-				// HIGH is legitimately AAC, so accept it.
-				respond(w, 200, playbackInfoBody("mp4a.40.2", srv.URL+"/stream/high"))
-			default:
-				respond(w, 404, map[string]string{"error": "not found"})
-			}
+			// Every tier reports AAC; walking the ladder would be wasteful.
+			respond(w, 200, playbackInfoBody("mp4a.40.2", srv.URL+"/stream/aac"))
 			return
 		}
-		if r.URL.Path == "/stream/high" {
-			_, _ = w.Write([]byte("high-aac-bytes"))
-			return
-		}
-		// Any hit on /stream/aac-downgraded would indicate a test failure,
-		// because the lossless tiers should never have followed the URL.
-		if r.URL.Path == "/stream/aac-downgraded" {
-			t.Errorf("downgraded AAC stream body was fetched -- ladder should have skipped it")
-		}
+		// The stream body is fetched by ffmpeg in production. For this test
+		// we only assert that tier selection stopped at HI_RES.
 	}))
 	defer srv.Close()
 
-	if got := readStreamString(t, newTestClient(srv)); got != "high-aac-bytes" {
-		t.Errorf("expected HIGH-tier body, got %q", got)
-	}
-	if len(seen) < 3 {
-		t.Errorf("expected at least three quality attempts, saw %v", seen)
+	// The call may fail locally if ffmpeg isn't installed -- that's fine,
+	// we're only asserting the tier-selection behaviour. Either way the
+	// test server records that exactly one playbackinfo request was made.
+	_, _, _ = newTestClient(srv).OpenStream(context.Background(), 123)
+	if len(seen) != 1 || seen[0] != "HI_RES_LOSSLESS" {
+		t.Errorf("expected a single HI_RES_LOSSLESS attempt, saw %v", seen)
 	}
 }
 

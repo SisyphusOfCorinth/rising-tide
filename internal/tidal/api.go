@@ -243,50 +243,56 @@ func (c *Client) Search(ctx context.Context, query string) ([]Track, []Album, []
 }
 
 // OpenStream resolves a track's playback manifest and returns a reader over
-// its audio bytestream. It walks the quality ladder
-// (HI_RES_LOSSLESS -> LOSSLESS -> HIGH -> LOW), rejecting tiers where Tidal
-// silently returns a lossy codec in response to a lossless request. The
-// returned reader hides the two possible Tidal delivery shapes:
+// its audio bytestream plus the codec string Tidal is delivering ("flac",
+// "mp4a.40.2", etc.). It walks the quality ladder (HI_RES_LOSSLESS ->
+// LOSSLESS -> HIGH -> LOW). The returned reader hides the two possible
+// Tidal delivery shapes:
 //
-//   - "application/vnd.tidal.bt" manifests: a single CDN URL. The reader is
-//     the raw HTTP response body.
-//   - "application/dash+xml" manifests: an MPEG-DASH MPD describing an init
-//     segment plus N media segments. The reader is a chain reader that
-//     fetches each segment in order and concatenates their bodies, so the
-//     downstream MP4 demuxer sees one continuous fMP4 stream.
+//   - "application/vnd.tidal.bt" manifests: a single CDN URL. For FLAC
+//     content the reader is the raw HTTP body; for AAC content ffmpeg is
+//     spawned to transcode to FLAC so the downstream decode pipeline
+//     remains codec-agnostic.
+//   - "application/dash+xml" manifests: an MPEG-DASH MPD describing an
+//     init segment plus N media segments. The reader is a chain reader
+//     that fetches each segment in order and concatenates their bodies,
+//     so the MP4 demuxer sees one continuous fMP4 stream.
+//
+// The codec string is the raw value from the manifest (not mutated by
+// transcoding) -- callers that want to show the user what Tidal is
+// actually serving should use it as-is.
 //
 // The endpoint used is /playbackinfopostpaywall -- the legacy
 // /urlpostpaywall endpoint is no longer trustworthy because Tidal routes
 // its responses to AAC CDN assets even when LOSSLESS is requested.
-func (c *Client) OpenStream(ctx context.Context, trackID int) (io.ReadCloser, error) {
+func (c *Client) OpenStream(ctx context.Context, trackID int) (io.ReadCloser, string, error) {
 	qualities := []string{"HI_RES_LOSSLESS", "LOSSLESS", "HIGH", "LOW"}
 	var lastErr error
 
 	for _, q := range qualities {
-		rc, err := c.openStreamAtQuality(ctx, trackID, q)
+		rc, codec, err := c.openStreamAtQuality(ctx, trackID, q)
 		if err != nil {
 			logger.L.Debug("stream quality rejected", "quality", q, "trackID", trackID, "err", err)
 			lastErr = err
 			continue
 		}
-		return rc, nil
+		return rc, codec, nil
 	}
-	return nil, lastErr
+	return nil, "", lastErr
 }
 
 // openStreamAtQuality fetches and resolves the playback manifest for a
 // single quality tier. It returns an io.ReadCloser positioned at the start
-// of the audio stream, or an error (with lossless-downgrade treated as an
-// error so OpenStream advances to the next tier).
-func (c *Client) openStreamAtQuality(ctx context.Context, trackID int, quality string) (io.ReadCloser, error) {
+// of the audio stream, the codec string, or an error (which causes
+// OpenStream to advance to the next tier).
+func (c *Client) openStreamAtQuality(ctx context.Context, trackID int, quality string) (io.ReadCloser, string, error) {
 	info, err := c.fetchPlaybackInfo(ctx, trackID, quality)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	manifestBytes, err := base64.StdEncoding.DecodeString(info.Manifest)
 	if err != nil {
-		return nil, fmt.Errorf("decode manifest base64: %w", err)
+		return nil, "", fmt.Errorf("decode manifest base64: %w", err)
 	}
 
 	switch info.ManifestMimeType {
@@ -295,7 +301,7 @@ func (c *Client) openStreamAtQuality(ctx context.Context, trackID int, quality s
 	case "application/dash+xml":
 		return c.openDashStream(ctx, manifestBytes, quality, trackID)
 	default:
-		return nil, fmt.Errorf("unsupported manifest type %q", info.ManifestMimeType)
+		return nil, "", fmt.Errorf("unsupported manifest type %q", info.ManifestMimeType)
 	}
 }
 
@@ -331,48 +337,54 @@ func (c *Client) fetchPlaybackInfo(ctx context.Context, trackID int, quality str
 	return &info, nil
 }
 
-// openBTStream handles the single-URL "vnd.tidal.bt" manifest: verify the
-// codec is acceptable, reject Common Encryption (we can't decrypt), then
-// return the HTTP body of the first URL.
-func (c *Client) openBTStream(ctx context.Context, manifestBytes []byte, quality string, trackID int) (io.ReadCloser, error) {
+// openBTStream handles the single-URL "vnd.tidal.bt" manifest. FLAC content
+// is streamed straight through; non-FLAC content (typically 320 kbps
+// AAC-LC, for tracks Tidal never mastered as lossless) is piped through
+// ffmpeg which demuxes the MP4, decodes AAC, and re-emits raw FLAC so the
+// player's FLAC pipeline still does the final decode and ALSA write. This
+// keeps every downstream component -- demuxer, decoder, mixer, ALSA
+// format selection -- on a single FLAC-only code path.
+func (c *Client) openBTStream(ctx context.Context, manifestBytes []byte, quality string, trackID int) (io.ReadCloser, string, error) {
 	var m btsManifest
 	if err := json.Unmarshal(manifestBytes, &m); err != nil {
-		return nil, fmt.Errorf("decode bt manifest: %w", err)
+		return nil, "", fmt.Errorf("decode bt manifest: %w", err)
 	}
 	if len(m.URLs) == 0 {
-		return nil, fmt.Errorf("bt manifest contained no URLs")
+		return nil, "", fmt.Errorf("bt manifest contained no URLs")
 	}
 	if m.EncryptionType != "" && m.EncryptionType != "NONE" {
-		return nil, fmt.Errorf("stream is encrypted (%s); not supported", m.EncryptionType)
+		return nil, "", fmt.Errorf("stream is encrypted (%s); not supported", m.EncryptionType)
 	}
-	if err := ensureAcceptableCodec(quality, m.Codecs); err != nil {
-		logger.L.Debug("stream quality downgraded by server, skipping",
-			"quality", quality, "trackID", trackID, "codec", m.Codecs)
-		return nil, err
+	if isLosslessCodec(m.Codecs) {
+		logger.L.Debug("stream quality selected",
+			"quality", quality, "trackID", trackID, "codec", m.Codecs, "manifest", "bt")
+		body, err := httpGetBody(ctx, m.URLs[0])
+		return body, m.Codecs, err
 	}
-	logger.L.Debug("stream quality selected",
+	logger.L.Debug("stream quality selected (transcoded)",
 		"quality", quality, "trackID", trackID, "codec", m.Codecs, "manifest", "bt")
-	return httpGetBody(ctx, m.URLs[0])
+	body, err := openAACTranscode(ctx, m.URLs[0])
+	return body, m.Codecs, err
 }
 
 // openDashStream handles a DASH+XML manifest by parsing it, building the
 // ordered list of (init + media) segment URLs, and returning a chain reader
 // that transparently fetches and concatenates segment bodies on read.
-func (c *Client) openDashStream(ctx context.Context, manifestBytes []byte, quality string, trackID int) (io.ReadCloser, error) {
+func (c *Client) openDashStream(ctx context.Context, manifestBytes []byte, quality string, trackID int) (io.ReadCloser, string, error) {
 	codec, initURL, mediaURLs, err := parseDashMPD(manifestBytes)
 	if err != nil {
-		return nil, fmt.Errorf("parse dash manifest: %w", err)
+		return nil, "", fmt.Errorf("parse dash manifest: %w", err)
 	}
 	if err := ensureAcceptableCodec(quality, codec); err != nil {
 		logger.L.Debug("stream quality downgraded by server, skipping",
 			"quality", quality, "trackID", trackID, "codec", codec)
-		return nil, err
+		return nil, "", err
 	}
 	logger.L.Debug("stream quality selected",
 		"quality", quality, "trackID", trackID, "codec", codec, "manifest", "dash",
 		"segments", len(mediaURLs))
 	segURLs := append([]string{initURL}, mediaURLs...)
-	return newSegmentChainReader(ctx, segURLs), nil
+	return newSegmentChainReader(ctx, segURLs), codec, nil
 }
 
 // ensureAcceptableCodec refuses lossless quality tiers when the server has

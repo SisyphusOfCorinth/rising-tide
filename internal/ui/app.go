@@ -237,10 +237,10 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Stream error: %v", msg.Err)
 			return m, nil
 		}
-		return m, startPlayback(m.player, msg.Track, msg.Opener)
+		return m, startPlayback(m.player, msg.Track, msg.Codec, msg.Opener)
 
 	case PlaybackStartedMsg:
-		m.nowPlaying.SetTrack(msg.Track.Title, msg.Track.Artist.Name, msg.Track.Album.Title)
+		m.nowPlaying.SetTrack(msg.Track.Title, msg.Track.Artist.Name, msg.Track.Album.Title, msg.Codec)
 		m.statusMsg = ""
 		cmds := []tea.Cmd{tickPlaybackProgress(), waitForPlaybackDone(m.player, m.playGeneration)}
 		// Fetch cover art if kitty is supported and this is a different album.
@@ -294,6 +294,12 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		pos, _ := m.player.GetPosition()
 		dur, _ := m.player.GetDuration()
 		m.nowPlaying.SetProgress(pos, dur)
+		// Sample rate / bit depth aren't known until the FLAC decoder has
+		// parsed the first header, which happens after playbackLoop starts.
+		// Poll every tick so the quality label populates as soon as the
+		// decoder has the answer.
+		rate, bits, _ := m.player.GetFormat()
+		m.nowPlaying.SetFormat(rate, bits)
 		return m, tickPlaybackProgress() // continue tick loop
 
 	// --- Device messages ---

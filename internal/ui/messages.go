@@ -67,16 +67,22 @@ type AlbumTracksMsg struct {
 // playback manifest and opened the first byte of its audio stream. The
 // Opener returns the already-open body on its first invocation and
 // re-resolves via the Tidal client on subsequent invocations (used by the
-// player when seeking).
+// player when seeking). Codec is the raw string from Tidal's manifest
+// ("flac", "mp4a.40.2", etc.) so the UI can surface the real-source codec
+// in the now-playing bar even when ffmpeg has transparently transcoded.
 type StreamReadyMsg struct {
 	Track  tidal.Track
+	Codec  string
 	Opener player.StreamOpener
 	Err    error
 }
 
-// PlaybackStartedMsg signals that audio playback has begun.
+// PlaybackStartedMsg signals that audio playback has begun. Codec is
+// forwarded from StreamReadyMsg so the App handler can stamp it onto
+// NowPlaying once the player confirms the stream has opened.
 type PlaybackStartedMsg struct {
 	Track tidal.Track
+	Codec string
 }
 
 // PlaybackErrorMsg signals a playback failure.

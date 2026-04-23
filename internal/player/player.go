@@ -526,6 +526,10 @@ func (p *Player) Play(opener StreamOpener) (<-chan struct{}, error) {
 
 	go func() {
 		defer close(loopDone)
+		// Cancelling ctx on return (normal or otherwise) ensures the
+		// body-close watcher in openStream tears down cleanly instead of
+		// leaking a goroutine that waits on ctx.Done forever.
+		defer cancel()
 		p.playbackLoop(ctx, opener, device, releaseReservation)
 		p.mu.Lock()
 		ch := p.doneCh
@@ -553,6 +557,12 @@ func (p *Player) stop() {
 		select {
 		case <-loopDone:
 		case <-time.After(3 * time.Second):
+			// Should be unreachable now that openStream's ctx watcher
+			// closes the body when ctx cancels. A hit here means a
+			// goroutine is still blocked somewhere downstream and the
+			// next Play may start while the old ALSA handle is still
+			// draining -- worth knowing about.
+			logger.L.Warn("stop timeout: playback loop did not exit within 3s")
 		}
 	}
 }
@@ -602,11 +612,27 @@ func (p *Player) PlayNext(opener StreamOpener) (<-chan struct{}, error) {
 // MP4/ISOBMFF, demux it on the fly so the decoder always sees a raw FLAC
 // bytestream. The caller owns the returned ReadCloser and must close it
 // when playback for this stream ends.
+//
+// A watcher goroutine is started alongside the stream: when ctx is
+// cancelled (typically because stop() is tearing playback down), it
+// closes the body. Without this, a stop() call could block while the
+// decode goroutine was stuck in stream.ParseNext -> pipe read -> body
+// read -- ctx cancellation alone doesn't unblock an in-flight HTTP read,
+// and the 3-second stop() timeout would then let a new ALSA handle open
+// against the same hw: device while the old one was still in flight,
+// producing static from the overlap. The watcher exits when ctx cancels
+// (either a real stop or the defer cancel() at the end of playbackLoop's
+// goroutine, which covers the natural end-of-track case).
 func openStream(ctx context.Context, opener StreamOpener) (io.ReadCloser, *flac.Stream, error) {
 	body, err := opener(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	go func() {
+		<-ctx.Done()
+		_ = body.Close()
+	}()
 
 	audio, err := unwrapFlacStream(body)
 	if err != nil {
@@ -1111,6 +1137,15 @@ func (p *Player) GetDuration() (float64, error) {
 		return 0, nil
 	}
 	return float64(ts) / float64(sr), nil
+}
+
+// GetFormat returns the current track's audio format: sample rate in Hz,
+// bit depth, and channel count. All fields are zero before the first
+// track's FLAC header has been parsed.
+func (p *Player) GetFormat() (rate uint32, bits uint8, channels uint8) {
+	p.muInfo.RLock()
+	defer p.muInfo.RUnlock()
+	return p.sampleRate, p.bitsPerSample, p.channels
 }
 
 // Seek jumps to the given absolute position in seconds without interrupting

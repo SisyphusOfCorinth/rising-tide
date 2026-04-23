@@ -94,18 +94,24 @@ func fetchAlbumTracks(client *tidal.Client, albumID int, albumTitle string) tea.
 // restart-from-zero + skip-forward-to-target).
 func resolveAndPlay(client *tidal.Client, track tidal.Track) tea.Cmd {
 	return func() tea.Msg {
-		body, err := client.OpenStream(context.Background(), track.ID)
+		body, codec, err := client.OpenStream(context.Background(), track.ID)
 		if err != nil {
 			return StreamReadyMsg{Track: track, Err: err}
 		}
-		return StreamReadyMsg{Track: track, Opener: cachedOpener(client, track.ID, body)}
+		return StreamReadyMsg{
+			Track:  track,
+			Codec:  codec,
+			Opener: cachedOpener(client, track.ID, body),
+		}
 	}
 }
 
 // cachedOpener returns a StreamOpener that yields the supplied already-open
 // body exactly once, then delegates to Tidal for any further opens. It is
 // safe for concurrent invocation -- the handoff happens under a mutex --
-// though in practice the player calls it sequentially.
+// though in practice the player calls it sequentially. The codec reported
+// by subsequent re-opens is discarded; the caller has already recorded it
+// from the initial resolution.
 func cachedOpener(client *tidal.Client, trackID int, first io.ReadCloser) player.StreamOpener {
 	var mu sync.Mutex
 	return func(ctx context.Context) (io.ReadCloser, error) {
@@ -116,18 +122,19 @@ func cachedOpener(client *tidal.Client, trackID int, first io.ReadCloser) player
 		if cached != nil {
 			return cached, nil
 		}
-		return client.OpenStream(ctx, trackID)
+		body, _, err := client.OpenStream(ctx, trackID)
+		return body, err
 	}
 }
 
 // startPlayback hands the opener to the player and reports the outcome.
-func startPlayback(p *player.Player, track tidal.Track, opener player.StreamOpener) tea.Cmd {
+func startPlayback(p *player.Player, track tidal.Track, codec string, opener player.StreamOpener) tea.Cmd {
 	return func() tea.Msg {
 		_, err := p.Play(opener)
 		if err != nil {
 			return PlaybackErrorMsg{Err: err}
 		}
-		return PlaybackStartedMsg{Track: track}
+		return PlaybackStartedMsg{Track: track, Codec: codec}
 	}
 }
 
